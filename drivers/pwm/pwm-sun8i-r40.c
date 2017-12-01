@@ -20,21 +20,21 @@
 #define PIS(ch)	BIT(ch)
 
 #define CAPTURE_IRQ_ENABLE_REG 	0x0010
-#define CFIE(ch)	BIT(ch * 2 + 1)
-#define CRIE(ch)	BIT(ch * 2)
+#define CFIE(ch)	BIT(ch << 1 + 1)
+#define CRIE(ch)	BIT(ch << 1)
 
 #define CAPTURE_IRQ_STATUS_REG 	0x0014
-#define CFIS(ch)	BIT(ch * 2 + 1)
-#define CRIS(ch)	BIT(ch * 2)
+#define CFIS(ch)	BIT(ch << 1 + 1)
+#define CRIS(ch)	BIT(ch << 1)
 
-#define CLK_CFG_REG(ch)	0x0020 + (u8)(ch / 2) * 4
+#define CLK_CFG_REG(ch)	0x0020 + (ch >> 1) * 4
 #define CLK_SRC 	BIT(7)
 #define CLK_SRC_BYPASS_SEC	BIT(6)
 #define CLK_SRC_BYPASS_FIR	BIT(5)
 #define CLK_GATING	BIT(4)
 #define CLK_DIV_M	GENMASK(3, 0)
 
-#define PWM_DZ_CTR_REG(ch)	0x0030 + (u8)(ch / 2) * 4
+#define PWM_DZ_CTR_REG(ch)	0x0030 + (ch >> 1) * 4
 #define PWM_DZ_INTV	GENMASK(15, 8)
 #define PWM_DZ_EN	BIT(0)
 
@@ -51,7 +51,7 @@
 #define PWM_ACT_STA	BIT(8)
 #define PWM_PRESCAL_K	GENMASK(7, 0)
 
-#define PWM_PERIOD_REG(ch)	0x0064 + ch * 020
+#define PWM_PERIOD_REG(ch)	0x0064 + ch * 0x20
 #define PWM_ENTIRE_CYCLE	GENMASK(31, 16)
 #define PWM_ACT_CYCLE	GENMASK(15, 0)
 
@@ -146,7 +146,6 @@ static void sunxi_pwm_set_value(struct sunxi_pwm_chip *sunxi_pwm,
 static void sunxi_pwm_set_polarity(struct sunxi_pwm_chip *chip, u32 ch, 
 		enum pwm_polarity polarity)
 {
-	/* set polarity bit */
 	if (polarity == PWM_POLARITY_NORMAL)
 		sunxi_pwm_set_bit(chip, PWM_CTR_REG(ch), PWM_ACT_STA); 
 	else
@@ -262,6 +261,13 @@ static int sunxi_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 		}
 	}
 
+	if (state->enabled)
+		sunxi_pwm_set_bit(sunxi_pwm, 
+				PWM_ENABLE_REG, PWM_EN(pwm->hwpwm));
+	else
+		sunxi_pwm_clear_bit(sunxi_pwm,
+			     	PWM_ENABLE_REG, PWM_EN(pwm->hwpwm));
+
 	spin_unlock(&sunxi_pwm->ctrl_lock);
 
 	return 0;
@@ -270,7 +276,39 @@ static int sunxi_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 static void sunxi_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
 		struct pwm_state *state)
 {
+	struct sunxi_pwm_chip *sunxi_pwm = to_sunxi_pwm_chip(chip);
+	u64 clk_rate, tmp;
+	u32 val;
+	u16 clk_div, act_cycle;
+	u8 prescal, id;
 
+	clk_rate = clk_get_rate(sunxi_pwm->clk);
+
+	val = sunxi_pwm_readl(sunxi_pwm, PWM_CTR_REG(pwm->hwpwm));
+	if (PWM_ACT_STA & val)
+		state->polarity = PWM_POLARITY_NORMAL;
+	else
+		state->polarity = PWM_POLARITY_INVERSED;
+
+	prescal = PWM_PRESCAL_K & val;
+
+	val = sunxi_pwm_readl(sunxi_pwm, PWM_ENABLE_REG);
+	if (PWM_EN(pwm->hwpwm) & val)
+		state->enabled = true;
+	else
+		state->enabled = false;
+
+	val = sunxi_pwm_readl(sunxi_pwm, PWM_PERIOD_REG(pwm->hwpwm));
+	act_cycle = PWM_ACT_CYCLE & val;
+	clk_div = val >> 16;
+
+	val = sunxi_pwm_readl(sunxi_pwm, CLK_CFG_REG(pwm->hwpwm));
+	id = CLK_DIV_M & val;
+
+	tmp = act_cycle * prescal * div_m_table[id] * NSEC_PER_SEC;
+	state->duty_cycle = DIV_ROUND_CLOSEST_ULL(tmp, clk_rate);
+	tmp = clk_div * prescal * div_m_table[id] * NSEC_PER_SEC;
+	state->period = DIV_ROUND_CLOSEST_ULL(tmp, clk_rate);
 }
 
 static const struct pwm_ops sunxi_pwm_ops = {
@@ -288,8 +326,10 @@ static const struct sunxi_pwm_data sunxi_pwm_data_r40 = {
 static const struct of_device_id sunxi_pwm_dt_ids[] = {
 	{
 		.compatible = "allwinner,sun8i-r40-pwm",
+		.data = &sunxi_pwm_data_r40,
 	},
 	{
+
 	},
 };
 MODULE_DEVICE_TABLE(of, sunxi_pwm_dt_ids);
@@ -316,7 +356,7 @@ static int sunxi_pwm_probe(struct platform_device *pdev)
 		return PTR_ERR(pwm->base);
 
 	//get pwm clock handler, then enable、set rate and so on. 
-	pwm->clk = devm_clk_get(&pdev->dev, NULL);
+	pwm->clk = devm_clk_get(&pdev->dev, "hosc");
 	if (IS_ERR(pwm->clk))
 		return PTR_ERR(pwm->clk);
 
@@ -328,6 +368,7 @@ static int sunxi_pwm_probe(struct platform_device *pdev)
 	pwm->chip.of_xlate = of_pwm_xlate_with_flags;
 	pwm->chip.of_pwm_n_cells = 3;
 
+	printk("npwm: %d\n", pwm->chip.npwm);
 	//refren to pwm.txt,
 	//it shoule be locked when seting pwm configuration.
 	spin_lock_init(&pwm->ctrl_lock);
