@@ -155,12 +155,12 @@ static void sunxi_pwm_set_polarity(struct sunxi_pwm_chip *chip, u32 ch,
 static int sunxi_pwm_config(struct sunxi_pwm_chip *sunxi_pwm, u32 ch,
 		struct pwm_state *state)
 {
-	u64 clk_rate, clk_div, prd;
-	u64 val;
-	u8 prescaler = 0, id = 0;
+	u64 clk_rate, clk_div, val;
+	u16 prescaler = 0;
+       	u8 id = 0;
 
 	clk_rate = clk_get_rate(sunxi_pwm->clk);
-	val = clk_rate;
+	dev_err(sunxi_pwm->chip.dev,"clock rate:%lld\n", clk_rate);
 
 	/* set pwm clock source */
 	if (clk_rate == 24000000)
@@ -178,26 +178,32 @@ static int sunxi_pwm_config(struct sunxi_pwm_chip *sunxi_pwm, u32 ch,
 			sunxi_pwm_set_bit(sunxi_pwm, CLK_CFG_REG(ch),
 					CLK_SRC_BYPASS_SEC);
 	}
-	
+
+	val = state->period * clk_rate;
+	/* 单位不同 */
 	do_div(val, NSEC_PER_SEC);
-	if (state->period <= val) {
+	dev_err(sunxi_pwm->chip.dev, "state->period:%d, clk_div:%lld\n",
+			state->period, val);
+	if (val < 1) {
 		dev_err(sunxi_pwm->chip.dev, 
 				"period expects a larger value\n");
 		return -EINVAL;
 	}
 
 	/* calculate and set prescalar, div table, pwn entrie cycle */
-	clk_div = (unsigned long long)clk_rate * state->period;
-	do_div(clk_div, NSEC_PER_SEC);
-	prd = clk_div;
-
+	clk_div = val;
 	// prescaler -----> PCR1.PWM_PRESCAL_K
 	// div_m_table[id] -------> PWM01_CLK_DIV_M
 	// clk_div ------> PWM_ENTIRE_CYCLE 
 	// clk_div < 65535 ??? ----> prescaler = 0, div_table = 0
 	while (clk_div > 65535) {
+		dev_err(sunxi_pwm->chip.dev,
+				"calculating >>> entire_cycle:%lld, " 
+				"prescaler:%d, "
+				"div_m_table[%d]:%d\n",
+				clk_div, prescaler, id, div_m_table[id]);
 		prescaler++;
-		clk_div = prd;
+		clk_div = val;
 		do_div(clk_div, prescaler + 1);
 		do_div(clk_div, div_m_table[id]);
 
@@ -208,6 +214,11 @@ static int sunxi_pwm_config(struct sunxi_pwm_chip *sunxi_pwm, u32 ch,
 				return -EINVAL;
 		}
 	}
+	dev_err(sunxi_pwm->chip.dev,
+			"calculating >>> entire_cycle:%lld, " 
+			"prescaler:%d, "
+			"div_m_table[%d]:%d\n",
+			clk_div, prescaler, id, div_m_table[id]);
 
 	sunxi_pwm_set_value(sunxi_pwm, PWM_PERIOD_REG(ch), 
 			PWM_ENTIRE_CYCLE, clk_div << 16);
@@ -217,8 +228,14 @@ static int sunxi_pwm_config(struct sunxi_pwm_chip *sunxi_pwm, u32 ch,
 			CLK_DIV_M, id << 0);
 
 	/* set duty */
-	do_div(clk_div, state->period);
-	do_div(clk_div, state->duty_cycle);
+	val = (prescaler + 1) * div_m_table[id] * clk_div;
+	val = state->period;
+	do_div(val, clk_div);
+	dev_err(sunxi_pwm->chip.dev,
+			"state->period / entire_cycle = %lld\n", val);
+	clk_div = state->duty_cycle;
+	do_div(clk_div, val);
+	dev_err(sunxi_pwm->chip.dev, "duty_cycle:%lld\n", clk_div);
 	sunxi_pwm_set_value(sunxi_pwm, PWM_PERIOD_REG(ch),
 			PWM_ACT_CYCLE, clk_div << 0);	
 
@@ -254,7 +271,7 @@ static int sunxi_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	/* set period and duty */
 	if ((cstate.period != state->period) ||
 			(cstate.duty_cycle != state->duty_cycle)) {
-		ret = sunxi_pwm_config(sunxi_pwm, pwm->hwpwm, &cstate);
+		ret = sunxi_pwm_config(sunxi_pwm, pwm->hwpwm, state);
 		if (ret) {
 			dev_err(chip->dev, "failed to enable PWM clock\n");
 			return ret;
@@ -320,7 +337,7 @@ static const struct pwm_ops sunxi_pwm_ops = {
 static const struct sunxi_pwm_data sunxi_pwm_data_r40 = {
 	.has_prescaler_bypass = false,
 	.has_rdy = true,
-	.npwm = 2,
+	.npwm = 8,
 };
 
 static const struct of_device_id sunxi_pwm_dt_ids[] = {
@@ -368,7 +385,7 @@ static int sunxi_pwm_probe(struct platform_device *pdev)
 	pwm->chip.of_xlate = of_pwm_xlate_with_flags;
 	pwm->chip.of_pwm_n_cells = 3;
 
-	printk("npwm: %d\n", pwm->chip.npwm);
+	dev_err(pwm->chip.dev, "npwm: %d\n", pwm->chip.npwm);
 	//refren to pwm.txt,
 	//it shoule be locked when seting pwm configuration.
 	spin_lock_init(&pwm->ctrl_lock);
