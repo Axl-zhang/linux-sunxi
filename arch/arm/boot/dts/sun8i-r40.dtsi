@@ -318,7 +318,7 @@
 	
 		pwm: pwm@1c23400 {
 			     compatible = "allwinner,sun8i-r40-pwm";
-			     reg = <0x01c23400 0x158>;
+			     reg = <0x01c23400 0x154>;
 			     clocks = <&osc24M>;
 			     clock-names = "hosc";
 			     #pwm-cells = <3>;
