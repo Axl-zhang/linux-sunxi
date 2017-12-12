@@ -154,7 +154,7 @@ static void sunxi_pwm_set_polarity(struct sunxi_pwm_chip *chip, u32 ch,
 
 static void sunxi_dump_reg(struct sunxi_pwm_chip *sunxi_pwm, u8 ch)
 {
-	dev_err(sunxi_pwm->chip.dev, "\tSUNXI PWM CH: %d\n"
+	dev_err(sunxi_pwm->chip.dev, "\nSUNXI PWM CH: %d\n"
 			"\tPWM_IRQ_ENABLE_REG(%04x): \t0x%08x\n"
 			"\tPWM_IRQ_STATUS_REG(%04x): \t0x%08x\n"
 			"\tCAPTURE_IRQ_ENABLE_REG(%04x): \t0x%08x\n"
@@ -198,6 +198,19 @@ static void sunxi_dump_reg(struct sunxi_pwm_chip *sunxi_pwm, u8 ch)
 			ch, readl(sunxi_pwm->base + CAPTURE_RISE_REG(ch)),
 			CAPTURE_FALL_REG(ch),
 			ch, readl(sunxi_pwm->base + CAPTURE_FALL_REG(ch)));
+}
+
+static void sunxi_gpio_dump(struct sunxi_pwm_chip *sunxi_pwm)
+{
+	volatile u32 *gpio_pb_cfg0, *gpio_pb_cfg2;
+	u32 value = ~(0x7 << 8);
+	
+	gpio_pb_cfg0 = (volatile u32 *)ioremap(0x01C20800 +  0x0024 , 4);
+
+	*gpio_pb_cfg0 &= value;
+	*gpio_pb_cfg0 |= 3 << 8;
+
+	dev_err(sunxi_pwm->chip.dev, "SUNXI GPIO PB_CFG0 DUMP: %08x\n", *gpio_pb_cfg0);
 }
 
 static int sunxi_pwm_config(struct sunxi_pwm_chip *sunxi_pwm, u8 ch,
@@ -303,6 +316,7 @@ static int sunxi_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	struct pwm_state cstate;
 
 	sunxi_dump_reg(sunxi_pwm, pwm->hwpwm);
+	sunxi_gpio_dump(sunxi_pwm);
 
 	pwm_get_state(pwm, &cstate);
 
@@ -349,6 +363,7 @@ static int sunxi_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	spin_unlock(&sunxi_pwm->ctrl_lock);
 
 	sunxi_dump_reg(sunxi_pwm, pwm->hwpwm);
+	sunxi_gpio_dump(sunxi_pwm);
 
 	return 0;
 }
@@ -420,7 +435,6 @@ static int sunxi_pwm_probe(struct platform_device *pdev)
 	struct resource *res;
 	int ret;
 	const struct of_device_id *match;
-	phys_addr_t reg;
 
 	//Tell if a struct device matches an of_device_id list
 	match = of_match_device(sunxi_pwm_dt_ids, &pdev->dev);
