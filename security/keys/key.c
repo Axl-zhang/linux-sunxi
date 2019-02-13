@@ -9,7 +9,7 @@
  * 2 of the License, or (at your option) any later version.
  */
 
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/poison.h>
 #include <linux/sched.h>
@@ -833,7 +833,6 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
 
 	key_check(keyring);
 
-	key_ref = ERR_PTR(-EPERM);
 	if (!(flags & KEY_ALLOC_BYPASS_RESTRICTION))
 		restrict_link = keyring->restrict_link;
 

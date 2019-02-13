@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * padata.c - generic interface to process data streams in parallel
  *
@@ -719,7 +720,7 @@ int padata_start(struct padata_instance *pinst)
 	if (pinst->flags & PADATA_INVALID)
 		err = -EINVAL;
 
-	 __padata_start(pinst);
+	__padata_start(pinst);
 
 	mutex_unlock(&pinst->lock);
 

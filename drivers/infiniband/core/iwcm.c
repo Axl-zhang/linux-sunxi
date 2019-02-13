@@ -80,7 +80,7 @@ const char *__attribute_const__ iwcm_reject_msg(int reason)
 }
 EXPORT_SYMBOL(iwcm_reject_msg);
 
-static struct rdma_nl_cbs iwcm_nl_cb_table[] = {
+static struct rdma_nl_cbs iwcm_nl_cb_table[RDMA_NL_IWPM_NUM_OPS] = {
 	[RDMA_NL_IWPM_REG_PID] = {.dump = iwpm_register_pid_cb},
 	[RDMA_NL_IWPM_ADD_MAPPING] = {.dump = iwpm_add_mapping_cb},
 	[RDMA_NL_IWPM_QUERY_MAPPING] = {.dump = iwpm_add_and_query_mapping_cb},
@@ -502,17 +502,21 @@ static void iw_cm_check_wildcard(struct sockaddr_storage *pm_addr,
  */
 static int iw_cm_map(struct iw_cm_id *cm_id, bool active)
 {
+	const char *devname = dev_name(&cm_id->device->dev);
+	const char *ifname = cm_id->device->iwcm->ifname;
 	struct iwpm_dev_data pm_reg_msg;
 	struct iwpm_sa_data pm_msg;
 	int status;
 
+	if (strlen(devname) >= sizeof(pm_reg_msg.dev_name) ||
+	    strlen(ifname) >= sizeof(pm_reg_msg.if_name))
+		return -EINVAL;
+
 	cm_id->m_local_addr = cm_id->local_addr;
 	cm_id->m_remote_addr = cm_id->remote_addr;
 
-	memcpy(pm_reg_msg.dev_name, cm_id->device->name,
-	       sizeof(pm_reg_msg.dev_name));
-	memcpy(pm_reg_msg.if_name, cm_id->device->iwcm->ifname,
-	       sizeof(pm_reg_msg.if_name));
+	strncpy(pm_reg_msg.dev_name, devname, sizeof(pm_reg_msg.dev_name));
+	strncpy(pm_reg_msg.if_name, ifname, sizeof(pm_reg_msg.if_name));
 
 	if (iwpm_register_pid(&pm_reg_msg, RDMA_NL_IWCM) ||
 	    !iwpm_valid_pid())

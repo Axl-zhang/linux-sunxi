@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * linux/fs/jbd2/transaction.c
  *
  * Written by Stephen C. Tweedie <sct@redhat.com>, 1998
  *
  * Copyright 1998 Red Hat corp --- All Rights Reserved
- *
- * This file is part of the Linux kernel and is made available under
- * the terms of the GNU General Public License, version 2, or at your
- * option, any later version, incorporated herein by reference.
  *
  * Generic filesystem transaction handling code; part of the ext2fs
  * journaling system.
@@ -52,10 +49,8 @@ int __init jbd2_journal_init_transaction_cache(void)
 
 void jbd2_journal_destroy_transaction_cache(void)
 {
-	if (transaction_cache) {
-		kmem_cache_destroy(transaction_cache);
-		transaction_cache = NULL;
-	}
+	kmem_cache_destroy(transaction_cache);
+	transaction_cache = NULL;
 }
 
 void jbd2_journal_free_transaction(transaction_t *transaction)
@@ -143,9 +138,9 @@ static inline void update_t_max_wait(transaction_t *transaction,
 }
 
 /*
- * Wait until running transaction passes T_LOCKED state. Also starts the commit
- * if needed. The function expects running transaction to exist and releases
- * j_state_lock.
+ * Wait until running transaction passes to T_FLUSH state and new transaction
+ * can thus be started. Also starts the commit if needed. The function expects
+ * running transaction to exist and releases j_state_lock.
  */
 static void wait_transaction_locked(journal_t *journal)
 	__releases(journal->j_state_lock)
@@ -161,6 +156,32 @@ static void wait_transaction_locked(journal_t *journal)
 	if (need_to_start)
 		jbd2_log_start_commit(journal, tid);
 	jbd2_might_wait_for_commit(journal);
+	schedule();
+	finish_wait(&journal->j_wait_transaction_locked, &wait);
+}
+
+/*
+ * Wait until running transaction transitions from T_SWITCH to T_FLUSH
+ * state and new transaction can thus be started. The function releases
+ * j_state_lock.
+ */
+static void wait_transaction_switching(journal_t *journal)
+	__releases(journal->j_state_lock)
+{
+	DEFINE_WAIT(wait);
+
+	if (WARN_ON(!journal->j_running_transaction ||
+		    journal->j_running_transaction->t_state != T_SWITCH))
+		return;
+	prepare_to_wait(&journal->j_wait_transaction_locked, &wait,
+			TASK_UNINTERRUPTIBLE);
+	read_unlock(&journal->j_state_lock);
+	/*
+	 * We don't call jbd2_might_wait_for_commit() here as there's no
+	 * waiting for outstanding handles happening anymore in T_SWITCH state
+	 * and handling of reserved handles actually relies on that for
+	 * correctness.
+	 */
 	schedule();
 	finish_wait(&journal->j_wait_transaction_locked, &wait);
 }
@@ -188,7 +209,8 @@ static int add_transaction_credits(journal_t *journal, int blocks,
 	 * If the current transaction is locked down for commit, wait
 	 * for the lock to be released.
 	 */
-	if (t->t_state == T_LOCKED) {
+	if (t->t_state != T_RUNNING) {
+		WARN_ON_ONCE(t->t_state >= T_FLUSH);
 		wait_transaction_locked(journal);
 		return 1;
 	}
@@ -365,8 +387,14 @@ repeat:
 		/*
 		 * We have handle reserved so we are allowed to join T_LOCKED
 		 * transaction and we don't have to check for transaction size
-		 * and journal space.
+		 * and journal space. But we still have to wait while running
+		 * transaction is being switched to a committing one as it
+		 * won't wait for any handles anymore.
 		 */
+		if (transaction->t_state == T_SWITCH) {
+			wait_transaction_switching(journal);
+			goto repeat;
+		}
 		sub_reserved_credits(journal, blocks);
 		handle->h_reserved = 0;
 	}
@@ -495,8 +523,10 @@ void jbd2_journal_free_reserved(handle_t *handle)
 EXPORT_SYMBOL(jbd2_journal_free_reserved);
 
 /**
- * int jbd2_journal_start_reserved(handle_t *handle) - start reserved handle
+ * int jbd2_journal_start_reserved() - start reserved handle
  * @handle: handle to start
+ * @type: for handle statistics
+ * @line_no: for handle statistics
  *
  * Start handle that has been previously reserved with jbd2_journal_reserve().
  * This attaches @handle to the running transaction (or creates one if there's
@@ -533,6 +563,7 @@ int jbd2_journal_start_reserved(handle_t *handle, unsigned int type,
 	 */
 	ret = start_this_handle(journal, handle, GFP_NOFS);
 	if (ret < 0) {
+		handle->h_journal = journal;
 		jbd2_journal_free_reserved(handle);
 		return ret;
 	}
@@ -626,6 +657,7 @@ error_out:
  * int jbd2_journal_restart() - restart a handle .
  * @handle:  handle to restart
  * @nblocks: nr credits requested
+ * @gfp_mask: memory allocation flags (for start_this_handle)
  *
  * Restart a handle for a multi-transaction filesystem
  * operation.
@@ -911,7 +943,7 @@ repeat:
 	 * this is the first time this transaction is touching this buffer,
 	 * reset the modified flag
 	 */
-       jh->b_modified = 0;
+	jh->b_modified = 0;
 
 	/*
 	 * If the buffer is not journaled right now, we need to make sure it
@@ -1362,6 +1394,13 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
 		if (jh->b_transaction == transaction &&
 		    jh->b_jlist != BJ_Metadata) {
 			jbd_lock_bh_state(bh);
+			if (jh->b_transaction == transaction &&
+			    jh->b_jlist != BJ_Metadata)
+				pr_err("JBD2: assertion failure: h_type=%u "
+				       "h_line_no=%u block_no=%llu jlist=%u\n",
+				       handle->h_type, handle->h_line_no,
+				       (unsigned long long) bh->b_blocknr,
+				       jh->b_jlist);
 			J_ASSERT_JH(jh, jh->b_transaction != transaction ||
 					jh->b_jlist == BJ_Metadata);
 			jbd_unlock_bh_state(bh);
@@ -1381,11 +1420,11 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
 		 * of the transaction. This needs to be done
 		 * once a transaction -bzzz
 		 */
-		jh->b_modified = 1;
 		if (handle->h_buffer_credits <= 0) {
 			ret = -ENOSPC;
 			goto out_unlock_bh;
 		}
+		jh->b_modified = 1;
 		handle->h_buffer_credits--;
 	}
 

@@ -1,19 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * comedi/comedi_fops.c
  * comedi kernel module
  *
  * COMEDI - Linux Control and Measurement Device Interface
  * Copyright (C) 1997-2000 David A. Schleef <ds@schleef.org>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -69,7 +60,7 @@ struct comedi_file {
 	struct comedi_subdevice *read_subdev;
 	struct comedi_subdevice *write_subdev;
 	unsigned int last_detach_count;
-	bool last_attached:1;
+	unsigned int last_attached:1;
 };
 
 #define COMEDI_NUM_MINORS 0x100
@@ -88,8 +79,8 @@ MODULE_PARM_DESC(comedi_default_buf_size_kb,
 		 "default asynchronous buffer size in KiB (default "
 		 __MODULE_STRING(CONFIG_COMEDI_DEFAULT_BUF_SIZE_KB) ")");
 
-unsigned int comedi_default_buf_maxsize_kb
-	= CONFIG_COMEDI_DEFAULT_BUF_MAXSIZE_KB;
+unsigned int comedi_default_buf_maxsize_kb =
+	CONFIG_COMEDI_DEFAULT_BUF_MAXSIZE_KB;
 module_param(comedi_default_buf_maxsize_kb, uint, 0644);
 MODULE_PARM_DESC(comedi_default_buf_maxsize_kb,
 		 "default maximum size of asynchronous buffer in KiB (default "
@@ -1218,11 +1209,16 @@ static int check_insn_config_length(struct comedi_insn *insn,
 		break;
 	case INSN_CONFIG_PWM_OUTPUT:
 	case INSN_CONFIG_ANALOG_TRIG:
+	case INSN_CONFIG_TIMER_1:
 		if (insn->n == 5)
 			return 0;
 		break;
 	case INSN_CONFIG_DIGITAL_TRIG:
 		if (insn->n == 6)
+			return 0;
+		break;
+	case INSN_CONFIG_GET_CMD_TIMING_CONSTRAINTS:
+		if (insn->n >= 4)
 			return 0;
 		break;
 		/*
@@ -1237,6 +1233,57 @@ static int check_insn_config_length(struct comedi_insn *insn,
 		return 0;
 	}
 	return -EINVAL;
+}
+
+static int check_insn_device_config_length(struct comedi_insn *insn,
+					   unsigned int *data)
+{
+	if (insn->n < 1)
+		return -EINVAL;
+
+	switch (data[0]) {
+	case INSN_DEVICE_CONFIG_TEST_ROUTE:
+	case INSN_DEVICE_CONFIG_CONNECT_ROUTE:
+	case INSN_DEVICE_CONFIG_DISCONNECT_ROUTE:
+		if (insn->n == 3)
+			return 0;
+		break;
+	case INSN_DEVICE_CONFIG_GET_ROUTES:
+		/*
+		 * Big enough for config_id and the length of the userland
+		 * memory buffer.  Additional length should be in factors of 2
+		 * to communicate any returned route pairs (source,destination).
+		 */
+		if (insn->n >= 2)
+			return 0;
+		break;
+	}
+	return -EINVAL;
+}
+
+/**
+ * get_valid_routes() - Calls low-level driver get_valid_routes function to
+ *			either return a count of valid routes to user, or copy
+ *			of list of all valid device routes to buffer in
+ *			userspace.
+ * @dev: comedi device pointer
+ * @data: data from user insn call.  The length of the data must be >= 2.
+ *	  data[0] must contain the INSN_DEVICE_CONFIG config_id.
+ *	  data[1](input) contains the number of _pairs_ for which memory is
+ *		  allotted from the user.  If the user specifies '0', then only
+ *		  the number of pairs available is returned.
+ *	  data[1](output) returns either the number of pairs available (if none
+ *		  where requested) or the number of _pairs_ that are copied back
+ *		  to the user.
+ *	  data[2::2] returns each (source, destination) pair.
+ *
+ * Return: -EINVAL if low-level driver does not allocate and return routes as
+ *	   expected.  Returns 0 otherwise.
+ */
+static int get_valid_routes(struct comedi_device *dev, unsigned int *data)
+{
+	data[1] = dev->get_valid_routes(dev, data[1], data + 2);
+	return 0;
 }
 
 static int parse_insn(struct comedi_device *dev, struct comedi_insn *insn,
@@ -1301,6 +1348,24 @@ static int parse_insn(struct comedi_device *dev, struct comedi_insn *insn,
 			ret = s->async->inttrig(dev, s, data[0]);
 			if (ret >= 0)
 				ret = 1;
+			break;
+		case INSN_DEVICE_CONFIG:
+			ret = check_insn_device_config_length(insn, data);
+			if (ret)
+				break;
+
+			if (data[0] == INSN_DEVICE_CONFIG_GET_ROUTES) {
+				/*
+				 * data[1] should be the number of _pairs_ that
+				 * the memory can hold.
+				 */
+				data[1] = (insn->n - 2) / 2;
+				ret = get_valid_routes(dev, data);
+				break;
+			}
+
+			/* other global device config instructions. */
+			ret = dev->insn_device_config(dev, insn, data);
 			break;
 		default:
 			dev_dbg(dev->class_dev, "invalid insn\n");
@@ -1436,24 +1501,20 @@ out:
  *	data (for reads) to insns[].data pointers
  */
 /* arbitrary limits */
-#define MAX_SAMPLES 256
+#define MIN_SAMPLES 16
+#define MAX_SAMPLES 65536
 static int do_insnlist_ioctl(struct comedi_device *dev,
 			     struct comedi_insnlist __user *arg, void *file)
 {
 	struct comedi_insnlist insnlist;
 	struct comedi_insn *insns = NULL;
 	unsigned int *data = NULL;
+	unsigned int max_n_data_required = MIN_SAMPLES;
 	int i = 0;
 	int ret = 0;
 
 	if (copy_from_user(&insnlist, arg, sizeof(insnlist)))
 		return -EFAULT;
-
-	data = kmalloc_array(MAX_SAMPLES, sizeof(unsigned int), GFP_KERNEL);
-	if (!data) {
-		ret = -ENOMEM;
-		goto error;
-	}
 
 	insns = kcalloc(insnlist.n_insns, sizeof(*insns), GFP_KERNEL);
 	if (!insns) {
@@ -1468,13 +1529,26 @@ static int do_insnlist_ioctl(struct comedi_device *dev,
 		goto error;
 	}
 
-	for (i = 0; i < insnlist.n_insns; i++) {
+	/* Determine maximum memory needed for all instructions. */
+	for (i = 0; i < insnlist.n_insns; ++i) {
 		if (insns[i].n > MAX_SAMPLES) {
 			dev_dbg(dev->class_dev,
 				"number of samples too large\n");
 			ret = -EINVAL;
 			goto error;
 		}
+		max_n_data_required = max(max_n_data_required, insns[i].n);
+	}
+
+	/* Allocate scratch space for all instruction data. */
+	data = kmalloc_array(max_n_data_required, sizeof(unsigned int),
+			     GFP_KERNEL);
+	if (!data) {
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	for (i = 0; i < insnlist.n_insns; ++i) {
 		if (insns[i].insn & INSN_MASK_WRITE) {
 			if (copy_from_user(data, insns[i].data,
 					   insns[i].n * sizeof(unsigned int))) {
@@ -1528,22 +1602,27 @@ static int do_insn_ioctl(struct comedi_device *dev,
 {
 	struct comedi_insn insn;
 	unsigned int *data = NULL;
+	unsigned int n_data = MIN_SAMPLES;
 	int ret = 0;
 
-	data = kmalloc_array(MAX_SAMPLES, sizeof(unsigned int), GFP_KERNEL);
+	if (copy_from_user(&insn, arg, sizeof(insn))) {
+		return -EFAULT;
+	}
+
+	n_data = max(n_data, insn.n);
+
+	/* This is where the behavior of insn and insnlist deviate. */
+	if (insn.n > MAX_SAMPLES) {
+		insn.n = MAX_SAMPLES;
+		n_data = MAX_SAMPLES;
+	}
+
+	data = kmalloc_array(n_data, sizeof(unsigned int), GFP_KERNEL);
 	if (!data) {
 		ret = -ENOMEM;
 		goto error;
 	}
 
-	if (copy_from_user(&insn, arg, sizeof(insn))) {
-		ret = -EFAULT;
-		goto error;
-	}
-
-	/* This is where the behavior of insn and insnlist deviate. */
-	if (insn.n > MAX_SAMPLES)
-		insn.n = MAX_SAMPLES;
 	if (insn.insn & INSN_MASK_WRITE) {
 		if (copy_from_user(data,
 				   insn.data,
@@ -2276,9 +2355,9 @@ done:
 	return retval;
 }
 
-static unsigned int comedi_poll(struct file *file, poll_table *wait)
+static __poll_t comedi_poll(struct file *file, poll_table *wait)
 {
-	unsigned int mask = 0;
+	__poll_t mask = 0;
 	struct comedi_file *cfp = file->private_data;
 	struct comedi_device *dev = cfp->dev;
 	struct comedi_subdevice *s, *s_read;
@@ -2297,7 +2376,7 @@ static unsigned int comedi_poll(struct file *file, poll_table *wait)
 		if (s->busy != file || !comedi_is_subdevice_running(s) ||
 		    (s->async->cmd.flags & CMDF_WRITE) ||
 		    comedi_buf_read_n_available(s) > 0)
-			mask |= POLLIN | POLLRDNORM;
+			mask |= EPOLLIN | EPOLLRDNORM;
 	}
 
 	s = comedi_file_write_subdevice(file);
@@ -2309,7 +2388,7 @@ static unsigned int comedi_poll(struct file *file, poll_table *wait)
 		if (s->busy != file || !comedi_is_subdevice_running(s) ||
 		    !(s->async->cmd.flags & CMDF_WRITE) ||
 		    comedi_buf_write_n_available(s) >= bps)
-			mask |= POLLOUT | POLLWRNORM;
+			mask |= EPOLLOUT | EPOLLWRNORM;
 	}
 
 done:

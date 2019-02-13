@@ -76,6 +76,7 @@ static uint i8k_fan_mult = I8K_FAN_MULT;
 static uint i8k_pwm_mult;
 static uint i8k_fan_max = I8K_FAN_HIGH;
 static bool disallow_fan_type_call;
+static bool disallow_fan_support;
 
 #define I8K_HWMON_HAVE_TEMP1	(1 << 0)
 #define I8K_HWMON_HAVE_TEMP2	(1 << 1)
@@ -242,6 +243,9 @@ static int i8k_get_fan_status(int fan)
 {
 	struct smm_regs regs = { .eax = I8K_SMM_GET_FAN, };
 
+	if (disallow_fan_support)
+		return -EINVAL;
+
 	regs.ebx = fan & 0xff;
 	return i8k_smm(&regs) ? : regs.eax & 0xff;
 }
@@ -252,6 +256,9 @@ static int i8k_get_fan_status(int fan)
 static int i8k_get_fan_speed(int fan)
 {
 	struct smm_regs regs = { .eax = I8K_SMM_GET_SPEED, };
+
+	if (disallow_fan_support)
+		return -EINVAL;
 
 	regs.ebx = fan & 0xff;
 	return i8k_smm(&regs) ? : (regs.eax & 0xffff) * i8k_fan_mult;
@@ -264,7 +271,7 @@ static int _i8k_get_fan_type(int fan)
 {
 	struct smm_regs regs = { .eax = I8K_SMM_GET_FAN_TYPE, };
 
-	if (disallow_fan_type_call)
+	if (disallow_fan_support || disallow_fan_type_call)
 		return -EINVAL;
 
 	regs.ebx = fan & 0xff;
@@ -289,6 +296,9 @@ static int i8k_get_fan_nominal_speed(int fan, int speed)
 {
 	struct smm_regs regs = { .eax = I8K_SMM_GET_NOM_SPEED, };
 
+	if (disallow_fan_support)
+		return -EINVAL;
+
 	regs.ebx = (fan & 0xff) | (speed << 8);
 	return i8k_smm(&regs) ? : (regs.eax & 0xffff) * i8k_fan_mult;
 }
@@ -299,6 +309,9 @@ static int i8k_get_fan_nominal_speed(int fan, int speed)
 static int i8k_set_fan(int fan, int speed)
 {
 	struct smm_regs regs = { .eax = I8K_SMM_SET_FAN, };
+
+	if (disallow_fan_support)
+		return -EINVAL;
 
 	speed = (speed < 0) ? 0 : ((speed > i8k_fan_max) ? i8k_fan_max : speed);
 	regs.ebx = (fan & 0xff) | (speed << 8);
@@ -605,7 +618,7 @@ static inline void __exit i8k_exit_procfs(void)
  * Hwmon interface
  */
 
-static ssize_t i8k_hwmon_show_temp_label(struct device *dev,
+static ssize_t i8k_hwmon_temp_label_show(struct device *dev,
 					 struct device_attribute *devattr,
 					 char *buf)
 {
@@ -628,7 +641,7 @@ static ssize_t i8k_hwmon_show_temp_label(struct device *dev,
 	return sprintf(buf, "%s\n", labels[type]);
 }
 
-static ssize_t i8k_hwmon_show_temp(struct device *dev,
+static ssize_t i8k_hwmon_temp_show(struct device *dev,
 				   struct device_attribute *devattr,
 				   char *buf)
 {
@@ -641,7 +654,7 @@ static ssize_t i8k_hwmon_show_temp(struct device *dev,
 	return sprintf(buf, "%d\n", temp * 1000);
 }
 
-static ssize_t i8k_hwmon_show_fan_label(struct device *dev,
+static ssize_t i8k_hwmon_fan_label_show(struct device *dev,
 					struct device_attribute *devattr,
 					char *buf)
 {
@@ -672,9 +685,8 @@ static ssize_t i8k_hwmon_show_fan_label(struct device *dev,
 	return sprintf(buf, "%s%s\n", (dock ? "Docking " : ""), labels[type]);
 }
 
-static ssize_t i8k_hwmon_show_fan(struct device *dev,
-				  struct device_attribute *devattr,
-				  char *buf)
+static ssize_t i8k_hwmon_fan_show(struct device *dev,
+				  struct device_attribute *devattr, char *buf)
 {
 	int index = to_sensor_dev_attr(devattr)->index;
 	int fan_speed;
@@ -685,9 +697,8 @@ static ssize_t i8k_hwmon_show_fan(struct device *dev,
 	return sprintf(buf, "%d\n", fan_speed);
 }
 
-static ssize_t i8k_hwmon_show_pwm(struct device *dev,
-				  struct device_attribute *devattr,
-				  char *buf)
+static ssize_t i8k_hwmon_pwm_show(struct device *dev,
+				  struct device_attribute *devattr, char *buf)
 {
 	int index = to_sensor_dev_attr(devattr)->index;
 	int status;
@@ -698,9 +709,9 @@ static ssize_t i8k_hwmon_show_pwm(struct device *dev,
 	return sprintf(buf, "%d\n", clamp_val(status * i8k_pwm_mult, 0, 255));
 }
 
-static ssize_t i8k_hwmon_set_pwm(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
+static ssize_t i8k_hwmon_pwm_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
 {
 	int index = to_sensor_dev_attr(attr)->index;
 	unsigned long val;
@@ -718,35 +729,23 @@ static ssize_t i8k_hwmon_set_pwm(struct device *dev,
 	return err < 0 ? -EIO : count;
 }
 
-static SENSOR_DEVICE_ATTR(temp1_input, S_IRUGO, i8k_hwmon_show_temp, NULL, 0);
-static SENSOR_DEVICE_ATTR(temp1_label, S_IRUGO, i8k_hwmon_show_temp_label, NULL,
-			  0);
-static SENSOR_DEVICE_ATTR(temp2_input, S_IRUGO, i8k_hwmon_show_temp, NULL, 1);
-static SENSOR_DEVICE_ATTR(temp2_label, S_IRUGO, i8k_hwmon_show_temp_label, NULL,
-			  1);
-static SENSOR_DEVICE_ATTR(temp3_input, S_IRUGO, i8k_hwmon_show_temp, NULL, 2);
-static SENSOR_DEVICE_ATTR(temp3_label, S_IRUGO, i8k_hwmon_show_temp_label, NULL,
-			  2);
-static SENSOR_DEVICE_ATTR(temp4_input, S_IRUGO, i8k_hwmon_show_temp, NULL, 3);
-static SENSOR_DEVICE_ATTR(temp4_label, S_IRUGO, i8k_hwmon_show_temp_label, NULL,
-			  3);
-static SENSOR_DEVICE_ATTR(fan1_input, S_IRUGO, i8k_hwmon_show_fan, NULL, 0);
-static SENSOR_DEVICE_ATTR(fan1_label, S_IRUGO, i8k_hwmon_show_fan_label, NULL,
-			  0);
-static SENSOR_DEVICE_ATTR(pwm1, S_IRUGO | S_IWUSR, i8k_hwmon_show_pwm,
-			  i8k_hwmon_set_pwm, 0);
-static SENSOR_DEVICE_ATTR(fan2_input, S_IRUGO, i8k_hwmon_show_fan, NULL,
-			  1);
-static SENSOR_DEVICE_ATTR(fan2_label, S_IRUGO, i8k_hwmon_show_fan_label, NULL,
-			  1);
-static SENSOR_DEVICE_ATTR(pwm2, S_IRUGO | S_IWUSR, i8k_hwmon_show_pwm,
-			  i8k_hwmon_set_pwm, 1);
-static SENSOR_DEVICE_ATTR(fan3_input, S_IRUGO, i8k_hwmon_show_fan, NULL,
-			  2);
-static SENSOR_DEVICE_ATTR(fan3_label, S_IRUGO, i8k_hwmon_show_fan_label, NULL,
-			  2);
-static SENSOR_DEVICE_ATTR(pwm3, S_IRUGO | S_IWUSR, i8k_hwmon_show_pwm,
-			  i8k_hwmon_set_pwm, 2);
+static SENSOR_DEVICE_ATTR_RO(temp1_input, i8k_hwmon_temp, 0);
+static SENSOR_DEVICE_ATTR_RO(temp1_label, i8k_hwmon_temp_label, 0);
+static SENSOR_DEVICE_ATTR_RO(temp2_input, i8k_hwmon_temp, 1);
+static SENSOR_DEVICE_ATTR_RO(temp2_label, i8k_hwmon_temp_label, 1);
+static SENSOR_DEVICE_ATTR_RO(temp3_input, i8k_hwmon_temp, 2);
+static SENSOR_DEVICE_ATTR_RO(temp3_label, i8k_hwmon_temp_label, 2);
+static SENSOR_DEVICE_ATTR_RO(temp4_input, i8k_hwmon_temp, 3);
+static SENSOR_DEVICE_ATTR_RO(temp4_label, i8k_hwmon_temp_label, 3);
+static SENSOR_DEVICE_ATTR_RO(fan1_input, i8k_hwmon_fan, 0);
+static SENSOR_DEVICE_ATTR_RO(fan1_label, i8k_hwmon_fan_label, 0);
+static SENSOR_DEVICE_ATTR_RW(pwm1, i8k_hwmon_pwm, 0);
+static SENSOR_DEVICE_ATTR_RO(fan2_input, i8k_hwmon_fan, 1);
+static SENSOR_DEVICE_ATTR_RO(fan2_label, i8k_hwmon_fan_label, 1);
+static SENSOR_DEVICE_ATTR_RW(pwm2, i8k_hwmon_pwm, 1);
+static SENSOR_DEVICE_ATTR_RO(fan3_input, i8k_hwmon_fan, 2);
+static SENSOR_DEVICE_ATTR_RO(fan3_label, i8k_hwmon_fan_label, 2);
+static SENSOR_DEVICE_ATTR_RW(pwm3, i8k_hwmon_pwm, 2);
 
 static struct attribute *i8k_attrs[] = {
 	&sensor_dev_attr_temp1_input.dev_attr.attr,	/* 0 */
@@ -772,6 +771,8 @@ static struct attribute *i8k_attrs[] = {
 static umode_t i8k_is_visible(struct kobject *kobj, struct attribute *attr,
 			      int index)
 {
+	if (disallow_fan_support && index >= 8)
+		return 0;
 	if (disallow_fan_type_call &&
 	    (index == 9 || index == 12 || index == 15))
 		return 0;
@@ -1002,6 +1003,13 @@ static const struct dmi_system_id i8k_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 15 9560"),
 		},
 	},
+	{
+		.ident = "Dell XPS 15 9570",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 15 9570"),
+		},
+	},
 	{ }
 };
 
@@ -1039,6 +1047,37 @@ static const struct dmi_system_id i8k_blacklist_fan_type_dmi_table[] __initconst
 };
 
 /*
+ * On some machines all fan related SMM functions implemented by Dell BIOS
+ * firmware freeze kernel for about 500ms. Until Dell fixes these problems fan
+ * support for affected blacklisted Dell machines stay disabled.
+ * See bug: https://bugzilla.kernel.org/show_bug.cgi?id=195751
+ */
+static struct dmi_system_id i8k_blacklist_fan_support_dmi_table[] __initdata = {
+	{
+		.ident = "Dell Inspiron 7720",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Inspiron 7720"),
+		},
+	},
+	{
+		.ident = "Dell Vostro 3360",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Vostro 3360"),
+		},
+	},
+	{
+		.ident = "Dell XPS13 9333",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS13 9333"),
+		},
+	},
+	{ }
+};
+
+/*
  * Probe for the presence of a supported laptop.
  */
 static int __init i8k_probe(void)
@@ -1060,8 +1099,17 @@ static int __init i8k_probe(void)
 			i8k_get_dmi_data(DMI_BIOS_VERSION));
 	}
 
-	if (dmi_check_system(i8k_blacklist_fan_type_dmi_table))
-		disallow_fan_type_call = true;
+	if (dmi_check_system(i8k_blacklist_fan_support_dmi_table)) {
+		pr_warn("broken Dell BIOS detected, disallow fan support\n");
+		if (!force)
+			disallow_fan_support = true;
+	}
+
+	if (dmi_check_system(i8k_blacklist_fan_type_dmi_table)) {
+		pr_warn("broken Dell BIOS detected, disallow fan type call\n");
+		if (!force)
+			disallow_fan_type_call = true;
+	}
 
 	strlcpy(bios_version, i8k_get_dmi_data(DMI_BIOS_VERSION),
 		sizeof(bios_version));

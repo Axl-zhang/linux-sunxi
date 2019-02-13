@@ -50,7 +50,7 @@ static int current_css_set_read(struct seq_file *seq, void *v)
 
 	spin_lock_irq(&css_set_lock);
 	rcu_read_lock();
-	cset = rcu_dereference(current->cgroups);
+	cset = task_css_set(current);
 	refcnt = refcount_read(&cset->refcount);
 	seq_printf(seq, "css_set %pK %d", cset, refcnt);
 	if (refcnt > cset->nr_tasks)
@@ -96,7 +96,7 @@ static int current_css_set_cg_links_read(struct seq_file *seq, void *v)
 
 	spin_lock_irq(&css_set_lock);
 	rcu_read_lock();
-	cset = rcu_dereference(current->cgroups);
+	cset = task_css_set(current);
 	list_for_each_entry(link, &cset->cgrp_links, cgrp_link) {
 		struct cgroup *c = link->cgrp;
 
@@ -373,11 +373,9 @@ struct cgroup_subsys debug_cgrp_subsys = {
  * On v2, debug is an implicit controller enabled by "cgroup_debug" boot
  * parameter.
  */
-static int __init enable_cgroup_debug(char *str)
+void __init enable_debug_cgroup(void)
 {
 	debug_cgrp_subsys.dfl_cftypes = debug_files;
 	debug_cgrp_subsys.implicit_on_dfl = true;
 	debug_cgrp_subsys.threaded = true;
-	return 1;
 }
-__setup("cgroup_debug", enable_cgroup_debug);

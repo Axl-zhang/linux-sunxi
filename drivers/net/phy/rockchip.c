@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /**
  * drivers/net/phy/rockchip.c
  *
@@ -6,12 +7,6 @@
  * Copyright (c) 2017, Fuzhou Rockchip Electronics Co., Ltd
  *
  * David Wu <david.wu@rock-chips.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
  */
 
 #include <linux/ethtool.h>
@@ -213,7 +208,6 @@ static struct phy_driver rockchip_phy_driver[] = {
 	.soft_reset		= genphy_soft_reset,
 	.config_init		= rockchip_integrated_phy_config_init,
 	.config_aneg		= rockchip_config_aneg,
-	.read_status		= genphy_read_status,
 	.suspend		= genphy_suspend,
 	.resume			= rockchip_phy_resume,
 },
@@ -230,4 +224,4 @@ MODULE_DEVICE_TABLE(mdio, rockchip_phy_tbl);
 
 MODULE_AUTHOR("David Wu <david.wu@rock-chips.com>");
 MODULE_DESCRIPTION("Rockchip Ethernet PHY driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

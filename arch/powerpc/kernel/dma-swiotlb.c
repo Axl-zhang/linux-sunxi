@@ -11,7 +11,7 @@
  *
  */
 
-#include <linux/dma-mapping.h>
+#include <linux/dma-direct.h>
 #include <linux/memblock.h>
 #include <linux/pfn.h>
 #include <linux/of_platform.h>
@@ -46,20 +46,19 @@ static u64 swiotlb_powerpc_get_required(struct device *dev)
  * map_page, and unmap_page on highmem, use normal dma_ops
  * for everything else.
  */
-const struct dma_map_ops swiotlb_dma_ops = {
-	.alloc = __dma_direct_alloc_coherent,
-	.free = __dma_direct_free_coherent,
-	.mmap = dma_direct_mmap_coherent,
-	.map_sg = swiotlb_map_sg_attrs,
-	.unmap_sg = swiotlb_unmap_sg_attrs,
+const struct dma_map_ops powerpc_swiotlb_dma_ops = {
+	.alloc = __dma_nommu_alloc_coherent,
+	.free = __dma_nommu_free_coherent,
+	.mmap = dma_nommu_mmap_coherent,
+	.map_sg = dma_direct_map_sg,
+	.unmap_sg = dma_direct_unmap_sg,
 	.dma_supported = swiotlb_dma_supported,
-	.map_page = swiotlb_map_page,
-	.unmap_page = swiotlb_unmap_page,
-	.sync_single_for_cpu = swiotlb_sync_single_for_cpu,
-	.sync_single_for_device = swiotlb_sync_single_for_device,
-	.sync_sg_for_cpu = swiotlb_sync_sg_for_cpu,
-	.sync_sg_for_device = swiotlb_sync_sg_for_device,
-	.mapping_error = swiotlb_dma_mapping_error,
+	.map_page = dma_direct_map_page,
+	.unmap_page = dma_direct_unmap_page,
+	.sync_single_for_cpu = dma_direct_sync_single_for_cpu,
+	.sync_single_for_device = dma_direct_sync_single_for_device,
+	.sync_sg_for_cpu = dma_direct_sync_sg_for_cpu,
+	.sync_sg_for_device = dma_direct_sync_sg_for_device,
 	.get_required_mask = swiotlb_powerpc_get_required,
 };
 
@@ -89,7 +88,7 @@ static int ppc_swiotlb_bus_notify(struct notifier_block *nb,
 
 	/* May need to bounce if the device can't address all of DRAM */
 	if ((dma_get_mask(dev) + 1) < memblock_end_of_DRAM())
-		set_dma_ops(dev, &swiotlb_dma_ops);
+		set_dma_ops(dev, &powerpc_swiotlb_dma_ops);
 
 	return NOTIFY_DONE;
 }
@@ -108,12 +107,8 @@ int __init swiotlb_setup_bus_notifier(void)
 
 void __init swiotlb_detect_4g(void)
 {
-	if ((memblock_end_of_DRAM() - 1) > 0xffffffff) {
+	if ((memblock_end_of_DRAM() - 1) > 0xffffffff)
 		ppc_swiotlb_enable = 1;
-#ifdef CONFIG_ZONE_DMA32
-		limit_zone_pfn(ZONE_DMA32, (1ULL << 32) >> PAGE_SHIFT);
-#endif
-	}
 }
 
 static int __init check_swiotlb_enabled(void)
@@ -121,7 +116,7 @@ static int __init check_swiotlb_enabled(void)
 	if (ppc_swiotlb_enable)
 		swiotlb_print_info();
 	else
-		swiotlb_free();
+		swiotlb_exit();
 
 	return 0;
 }

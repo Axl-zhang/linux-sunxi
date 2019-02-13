@@ -14,8 +14,10 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
-#include <drm/drm_crtc_helper.h>
+#include <drm/drm_bridge.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_mipi_dsi.h>
+#include <drm/drm_modes.h>
 
 #define ADV7511_REG_CHIP_REVISION		0x00
 #define ADV7511_REG_N0				0x01
@@ -92,6 +94,11 @@
 #define ADV7511_REG_CEC_CTRL			0xe2
 #define ADV7511_REG_CHIP_ID_HIGH		0xf5
 #define ADV7511_REG_CHIP_ID_LOW			0xf6
+
+/* Hardware defined default addresses for I2C register maps */
+#define ADV7511_CEC_I2C_ADDR_DEFAULT		0x3c
+#define ADV7511_EDID_I2C_ADDR_DEFAULT		0x3f
+#define ADV7511_PACKET_I2C_ADDR_DEFAULT		0x38
 
 #define ADV7511_CSC_ENABLE			BIT(7)
 #define ADV7511_CSC_UPDATE_MODE			BIT(5)
@@ -321,6 +328,7 @@ enum adv7511_type {
 struct adv7511 {
 	struct i2c_client *i2c_main;
 	struct i2c_client *i2c_edid;
+	struct i2c_client *i2c_packet;
 	struct i2c_client *i2c_cec;
 
 	struct regmap *regmap;
@@ -372,15 +380,24 @@ struct adv7511 {
 };
 
 #ifdef CONFIG_DRM_I2C_ADV7511_CEC
-int adv7511_cec_init(struct device *dev, struct adv7511 *adv7511,
-		     unsigned int offset);
+int adv7511_cec_init(struct device *dev, struct adv7511 *adv7511);
 void adv7511_cec_irq_process(struct adv7511 *adv7511, unsigned int irq1);
+#else
+static inline int adv7511_cec_init(struct device *dev, struct adv7511 *adv7511)
+{
+	unsigned int offset = adv7511->type == ADV7533 ?
+						ADV7533_REG_CEC_OFFSET : 0;
+
+	regmap_write(adv7511->regmap, ADV7511_REG_CEC_CTRL + offset,
+		     ADV7511_CEC_CTRL_POWER_DOWN);
+	return 0;
+}
 #endif
 
 #ifdef CONFIG_DRM_I2C_ADV7533
 void adv7533_dsi_power_on(struct adv7511 *adv);
 void adv7533_dsi_power_off(struct adv7511 *adv);
-void adv7533_mode_set(struct adv7511 *adv, struct drm_display_mode *mode);
+void adv7533_mode_set(struct adv7511 *adv, const struct drm_display_mode *mode);
 int adv7533_patch_registers(struct adv7511 *adv);
 int adv7533_patch_cec_registers(struct adv7511 *adv);
 int adv7533_attach_dsi(struct adv7511 *adv);
@@ -396,7 +413,7 @@ static inline void adv7533_dsi_power_off(struct adv7511 *adv)
 }
 
 static inline void adv7533_mode_set(struct adv7511 *adv,
-				    struct drm_display_mode *mode)
+				    const struct drm_display_mode *mode)
 {
 }
 

@@ -1,17 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * the_nilfs.c - the_nilfs shared structure.
  *
  * Copyright (C) 2005-2008 Nippon Telegraph and Telephone Corporation.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  *
  * Written by Ryusuke Konishi.
  *
@@ -220,7 +211,7 @@ int load_nilfs(struct the_nilfs *nilfs, struct super_block *sb)
 
 	if (!valid_fs) {
 		nilfs_msg(sb, KERN_WARNING, "mounting unchecked fs");
-		if (s_flags & MS_RDONLY) {
+		if (s_flags & SB_RDONLY) {
 			nilfs_msg(sb, KERN_INFO,
 				  "recovery required for readonly filesystem");
 			nilfs_msg(sb, KERN_INFO,
@@ -286,7 +277,7 @@ int load_nilfs(struct the_nilfs *nilfs, struct super_block *sb)
 	if (valid_fs)
 		goto skip_recovery;
 
-	if (s_flags & MS_RDONLY) {
+	if (s_flags & SB_RDONLY) {
 		__u64 features;
 
 		if (nilfs_test_opt(nilfs, NORECOVERY)) {
@@ -309,7 +300,7 @@ int load_nilfs(struct the_nilfs *nilfs, struct super_block *sb)
 			err = -EROFS;
 			goto failed_unload;
 		}
-		sb->s_flags &= ~MS_RDONLY;
+		sb->s_flags &= ~SB_RDONLY;
 	} else if (nilfs_test_opt(nilfs, NORECOVERY)) {
 		nilfs_msg(sb, KERN_ERR,
 			  "recovery cancelled because norecovery option was specified for a read/write mount");

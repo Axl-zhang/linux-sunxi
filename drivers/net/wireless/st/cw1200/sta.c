@@ -198,7 +198,7 @@ void __cw1200_cqm_bssloss_sm(struct cw1200_common *priv,
 
 		priv->bss_loss_state++;
 
-		skb = ieee80211_nullfunc_get(priv->hw, priv->vif);
+		skb = ieee80211_nullfunc_get(priv->hw, priv->vif, false);
 		WARN_ON(!skb);
 		if (skb)
 			cw1200_tx(priv->hw, NULL, skb);
@@ -1123,7 +1123,7 @@ int cw1200_setup_mac(struct cw1200_common *priv)
 	 *
 	 * NOTE2: RSSI based reports have been switched to RCPI, since
 	 * FW has a bug and RSSI reported values are not stable,
-	 * what can leads to signal level oscilations in user-end applications
+	 * what can lead to signal level oscilations in user-end applications
 	 */
 	struct wsm_rcpi_rssi_threshold threshold = {
 		.rssiRcpiMode = WSM_RCPI_RSSI_THRESHOLD_ENABLE |
@@ -2265,7 +2265,7 @@ static int cw1200_upload_null(struct cw1200_common *priv)
 		.rate = 0xFF,
 	};
 
-	frame.skb = ieee80211_nullfunc_get(priv->hw, priv->vif);
+	frame.skb = ieee80211_nullfunc_get(priv->hw, priv->vif, false);
 	if (!frame.skb)
 		return -ENOMEM;
 

@@ -27,12 +27,11 @@
 #include <linux/mm.h>
 #include <linux/stddef.h>
 #include <linux/init.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/highmem.h>
 #include <linux/initrd.h>
 #include <linux/pagemap.h>
 #include <linux/suspend.h>
-#include <linux/memblock.h>
 #include <linux/hugetlb.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -63,6 +62,7 @@
 #endif
 
 unsigned long long memory_limit;
+bool init_mem_is_free;
 
 #ifdef CONFIG_HIGHMEM
 pte_t *kmap_pte;
@@ -82,17 +82,7 @@ static inline pte_t *virt_to_kpte(unsigned long vaddr)
 
 int page_is_ram(unsigned long pfn)
 {
-#ifndef CONFIG_PPC64	/* XXX for now */
-	return pfn < max_pfn;
-#else
-	unsigned long paddr = (pfn << PAGE_SHIFT);
-	struct memblock_region *reg;
-
-	for_each_memblock(memory, reg)
-		if (paddr >= reg->base && paddr < (reg->base + reg->size))
-			return 1;
-	return 0;
-#endif
+	return memblock_is_memory(__pfn_to_phys(pfn));
 }
 
 pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
@@ -117,7 +107,7 @@ int memory_add_physaddr_to_nid(u64 start)
 }
 #endif
 
-int __weak create_section_mapping(unsigned long start, unsigned long end)
+int __weak create_section_mapping(unsigned long start, unsigned long end, int nid)
 {
 	return -ENODEV;
 }
@@ -127,7 +117,8 @@ int __weak remove_section_mapping(unsigned long start, unsigned long end)
 	return -ENODEV;
 }
 
-int arch_add_memory(int nid, u64 start, u64 size, bool want_memblock)
+int __meminit arch_add_memory(int nid, u64 start, u64 size, struct vmem_altmap *altmap,
+		bool want_memblock)
 {
 	unsigned long start_pfn = start >> PAGE_SHIFT;
 	unsigned long nr_pages = size >> PAGE_SHIFT;
@@ -136,23 +127,23 @@ int arch_add_memory(int nid, u64 start, u64 size, bool want_memblock)
 	resize_hpt_for_hotplug(memblock_phys_mem_size());
 
 	start = (unsigned long)__va(start);
-	rc = create_section_mapping(start, start + size);
+	rc = create_section_mapping(start, start + size, nid);
 	if (rc) {
-		pr_warning(
-			"Unable to create mapping for hot added memory 0x%llx..0x%llx: %d\n",
+		pr_warn("Unable to create mapping for hot added memory 0x%llx..0x%llx: %d\n",
 			start, start + size, rc);
 		return -EFAULT;
 	}
+	flush_inval_dcache_range(start, start + size);
 
-	return __add_pages(nid, start_pfn, nr_pages, want_memblock);
+	return __add_pages(nid, start_pfn, nr_pages, altmap, want_memblock);
 }
 
 #ifdef CONFIG_MEMORY_HOTREMOVE
-int arch_remove_memory(u64 start, u64 size)
+int __meminit arch_remove_memory(int nid, u64 start, u64 size,
+					struct vmem_altmap *altmap)
 {
 	unsigned long start_pfn = start >> PAGE_SHIFT;
 	unsigned long nr_pages = size >> PAGE_SHIFT;
-	struct vmem_altmap *altmap;
 	struct page *page;
 	int ret;
 
@@ -161,16 +152,16 @@ int arch_remove_memory(u64 start, u64 size)
 	 * when querying the zone.
 	 */
 	page = pfn_to_page(start_pfn);
-	altmap = to_vmem_altmap((unsigned long) page);
 	if (altmap)
 		page += vmem_altmap_offset(altmap);
 
-	ret = __remove_pages(page_zone(page), start_pfn, nr_pages);
+	ret = __remove_pages(page_zone(page), start_pfn, nr_pages, altmap);
 	if (ret)
 		return ret;
 
 	/* Remove htab bolted mappings for this section of memory */
 	start = (unsigned long)__va(start);
+	flush_inval_dcache_range(start, start + size);
 	ret = remove_section_mapping(start, start + size);
 
 	/* Ensure all vmalloc mappings are flushed in case they also
@@ -214,7 +205,7 @@ walk_system_ram_range(unsigned long start_pfn, unsigned long nr_pages,
 EXPORT_SYMBOL_GPL(walk_system_ram_range);
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES
-void __init initmem_init(void)
+void __init mem_topology_setup(void)
 {
 	max_low_pfn = max_pfn = memblock_end_of_DRAM() >> PAGE_SHIFT;
 	min_low_pfn = MEMORY_START >> PAGE_SHIFT;
@@ -225,8 +216,11 @@ void __init initmem_init(void)
 	/* Place all memblock_regions in the same node and merge contiguous
 	 * memblock_regions
 	 */
-	memblock_set_node(0, (phys_addr_t)ULLONG_MAX, &memblock.memory, 0);
+	memblock_set_node(0, PHYS_ADDR_MAX, &memblock.memory, 0);
+}
 
+void __init initmem_init(void)
+{
 	/* XXX need to clip this if using highmem? */
 	sparse_memory_present_with_active_regions(0);
 	sparse_init();
@@ -253,35 +247,19 @@ static int __init mark_nonram_nosave(void)
 }
 #endif
 
-static bool zone_limits_final;
-
 /*
- * The memory zones past TOP_ZONE are managed by generic mm code.
- * These should be set to zero since that's what every other
- * architecture does.
+ * Zones usage:
+ *
+ * We setup ZONE_DMA to be 31-bits on all platforms and ZONE_NORMAL to be
+ * everything else. GFP_DMA32 page allocations automatically fall back to
+ * ZONE_DMA.
+ *
+ * By using 31-bit unconditionally, we can exploit ARCH_ZONE_DMA_BITS to
+ * inform the generic DMA mapping code.  32-bit only devices (if not handled
+ * by an IOMMU anyway) will take a first dip into ZONE_NORMAL and get
+ * otherwise served by ZONE_DMA.
  */
-static unsigned long max_zone_pfns[MAX_NR_ZONES] = {
-	[0            ... TOP_ZONE        ] = ~0UL,
-	[TOP_ZONE + 1 ... MAX_NR_ZONES - 1] = 0
-};
-
-/*
- * Restrict the specified zone and all more restrictive zones
- * to be below the specified pfn.  May not be called after
- * paging_init().
- */
-void __init limit_zone_pfn(enum zone_type zone, unsigned long pfn_limit)
-{
-	int i;
-
-	if (WARN_ON(zone_limits_final))
-		return;
-
-	for (i = zone; i >= 0; i--) {
-		if (max_zone_pfns[i] > pfn_limit)
-			max_zone_pfns[i] = pfn_limit;
-	}
-}
+static unsigned long max_zone_pfns[MAX_NR_ZONES];
 
 /*
  * Find the least restrictive zone that is entirely below the
@@ -315,11 +293,11 @@ void __init paging_init(void)
 	unsigned long end = __fix_to_virt(FIX_HOLE);
 
 	for (; v < end; v += PAGE_SIZE)
-		map_kernel_page(v, 0, 0); /* XXX gross */
+		map_kernel_page(v, 0, __pgprot(0)); /* XXX gross */
 #endif
 
 #ifdef CONFIG_HIGHMEM
-	map_kernel_page(PKMAP_BASE, 0, 0);	/* XXX gross */
+	map_kernel_page(PKMAP_BASE, 0, __pgprot(0));	/* XXX gross */
 	pkmap_page_table = virt_to_kpte(PKMAP_BASE);
 
 	kmap_pte = virt_to_kpte(__fix_to_virt(FIX_KMAP_BEGIN));
@@ -331,11 +309,14 @@ void __init paging_init(void)
 	printk(KERN_DEBUG "Memory hole size: %ldMB\n",
 	       (long int)((top_of_ram - total_ram) >> 20));
 
-#ifdef CONFIG_HIGHMEM
-	limit_zone_pfn(ZONE_NORMAL, lowmem_end_addr >> PAGE_SHIFT);
+#ifdef CONFIG_ZONE_DMA
+	max_zone_pfns[ZONE_DMA]	= min(max_low_pfn, 0x7fffffffUL >> PAGE_SHIFT);
 #endif
-	limit_zone_pfn(TOP_ZONE, top_of_ram >> PAGE_SHIFT);
-	zone_limits_final = true;
+	max_zone_pfns[ZONE_NORMAL] = max_low_pfn;
+#ifdef CONFIG_HIGHMEM
+	max_zone_pfns[ZONE_HIGHMEM] = max_pfn;
+#endif
+
 	free_area_init_nodes(max_zone_pfns);
 
 	mark_nonram_nosave();
@@ -355,7 +336,7 @@ void __init mem_init(void)
 
 	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
 	set_max_mapnr(max_pfn);
-	free_all_bootmem();
+	memblock_free_all();
 
 #ifdef CONFIG_HIGHMEM
 	{
@@ -403,6 +384,7 @@ void free_initmem(void)
 {
 	ppc_md.progress = ppc_printk_progress;
 	mark_initmem_nx();
+	init_mem_is_free = true;
 	free_initmem_default(POISON_FREE_INITMEM);
 }
 
@@ -509,15 +491,18 @@ EXPORT_SYMBOL(flush_icache_user_range);
 void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
 		      pte_t *ptep)
 {
-#ifdef CONFIG_PPC_STD_MMU
+#ifdef CONFIG_PPC_BOOK3S
 	/*
 	 * We don't need to worry about _PAGE_PRESENT here because we are
 	 * called with either mm->page_table_lock held or ptl lock held
 	 */
-	unsigned long access, trap;
+	unsigned long trap;
+	bool is_exec;
 
-	if (radix_enabled())
+	if (radix_enabled()) {
+		prefetch((void *)address);
 		return;
+	}
 
 	/* We only want HPTEs for linux PTEs that have _PAGE_ACCESSED set */
 	if (!pte_young(*ptep) || address >= TASK_SIZE)
@@ -534,17 +519,17 @@ void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
 	trap = current->thread.regs ? TRAP(current->thread.regs) : 0UL;
 	switch (trap) {
 	case 0x300:
-		access = 0UL;
+		is_exec = false;
 		break;
 	case 0x400:
-		access = _PAGE_EXEC;
+		is_exec = true;
 		break;
 	default:
 		return;
 	}
 
-	hash_preload(vma->vm_mm, address, access, trap);
-#endif /* CONFIG_PPC_STD_MMU */
+	hash_preload(vma->vm_mm, address, is_exec, trap);
+#endif /* CONFIG_PPC_BOOK3S */
 #if (defined(CONFIG_PPC_BOOK3E_64) || defined(CONFIG_PPC_FSL_BOOK3E)) \
 	&& defined(CONFIG_HUGETLB_PAGE)
 	if (is_vm_hugetlb_page(vma))

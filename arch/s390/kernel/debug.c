@@ -194,11 +194,13 @@ static debug_entry_t ***debug_areas_alloc(int pages_per_area, int nr_areas)
 	debug_entry_t ***areas;
 	int i, j;
 
-	areas = kmalloc(nr_areas * sizeof(debug_entry_t **), GFP_KERNEL);
+	areas = kmalloc_array(nr_areas, sizeof(debug_entry_t **), GFP_KERNEL);
 	if (!areas)
 		goto fail_malloc_areas;
 	for (i = 0; i < nr_areas; i++) {
-		areas[i] = kmalloc(pages_per_area * sizeof(debug_entry_t *), GFP_KERNEL);
+		areas[i] = kmalloc_array(pages_per_area,
+					 sizeof(debug_entry_t *),
+					 GFP_KERNEL);
 		if (!areas[i])
 			goto fail_malloc_areas2;
 		for (j = 0; j < pages_per_area; j++) {
@@ -1392,7 +1394,7 @@ int debug_dflt_header_fn(debug_info_t *id, struct debug_view *view,
 	else
 		except_str = "-";
 	caller = (unsigned long) entry->caller;
-	rc += sprintf(out_buf, "%02i %011ld:%06lu %1u %1s %02i %p  ",
+	rc += sprintf(out_buf, "%02i %011ld:%06lu %1u %1s %02i %pK  ",
 		      area, sec, usec, level, except_str,
 		      entry->id.fields.cpuid, (void *)caller);
 	return rc;

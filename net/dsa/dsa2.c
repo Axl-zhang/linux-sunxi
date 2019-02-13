@@ -51,9 +51,7 @@ static struct dsa_switch_tree *dsa_tree_alloc(int index)
 	INIT_LIST_HEAD(&dst->list);
 	list_add_tail(&dsa_tree_list, &dst->list);
 
-	/* Initialize the reference counter to the number of switches, not 1 */
 	kref_init(&dst->refcount);
-	refcount_set(&dst->refcount.refcount, 0);
 
 	return dst;
 }
@@ -64,20 +62,23 @@ static void dsa_tree_free(struct dsa_switch_tree *dst)
 	kfree(dst);
 }
 
+static struct dsa_switch_tree *dsa_tree_get(struct dsa_switch_tree *dst)
+{
+	if (dst)
+		kref_get(&dst->refcount);
+
+	return dst;
+}
+
 static struct dsa_switch_tree *dsa_tree_touch(int index)
 {
 	struct dsa_switch_tree *dst;
 
 	dst = dsa_tree_find(index);
-	if (!dst)
-		dst = dsa_tree_alloc(index);
-
-	return dst;
-}
-
-static void dsa_tree_get(struct dsa_switch_tree *dst)
-{
-	kref_get(&dst->refcount);
+	if (dst)
+		return dsa_tree_get(dst);
+	else
+		return dsa_tree_alloc(index);
 }
 
 static void dsa_tree_release(struct kref *ref)
@@ -91,7 +92,8 @@ static void dsa_tree_release(struct kref *ref)
 
 static void dsa_tree_put(struct dsa_switch_tree *dst)
 {
-	kref_put(&dst->refcount, dsa_tree_release);
+	if (dst)
+		kref_put(&dst->refcount, dsa_tree_release);
 }
 
 static bool dsa_port_is_dsa(struct dsa_port *port)
@@ -239,7 +241,7 @@ static int dsa_tree_setup_default_cpu(struct dsa_switch_tree *dst)
 		for (port = 0; port < ds->num_ports; port++) {
 			dp = &ds->ports[port];
 
-			if (dsa_port_is_user(dp))
+			if (dsa_port_is_user(dp) || dsa_port_is_dsa(dp))
 				dp->cpu_dp = dst->cpu_dp;
 		}
 	}
@@ -256,11 +258,13 @@ static void dsa_tree_teardown_default_cpu(struct dsa_switch_tree *dst)
 static int dsa_port_setup(struct dsa_port *dp)
 {
 	struct dsa_switch *ds = dp->ds;
-	int err;
+	int err = 0;
 
 	memset(&dp->devlink_port, 0, sizeof(dp->devlink_port));
 
-	err = devlink_port_register(ds->devlink, &dp->devlink_port, dp->index);
+	if (dp->type != DSA_PORT_TYPE_UNUSED)
+		err = devlink_port_register(ds->devlink, &dp->devlink_port,
+					    dp->index);
 	if (err)
 		return err;
 
@@ -268,16 +272,39 @@ static int dsa_port_setup(struct dsa_port *dp)
 	case DSA_PORT_TYPE_UNUSED:
 		break;
 	case DSA_PORT_TYPE_CPU:
-	case DSA_PORT_TYPE_DSA:
-		err = dsa_port_fixed_link_register_of(dp);
+		/* dp->index is used now as port_number. However
+		 * CPU ports should have separate numbering
+		 * independent from front panel port numbers.
+		 */
+		devlink_port_attrs_set(&dp->devlink_port,
+				       DEVLINK_PORT_FLAVOUR_CPU,
+				       dp->index, false, 0);
+		err = dsa_port_link_register_of(dp);
 		if (err) {
-			dev_err(ds->dev, "failed to register fixed link for port %d.%d\n",
+			dev_err(ds->dev, "failed to setup link for port %d.%d\n",
 				ds->index, dp->index);
 			return err;
 		}
-
+		break;
+	case DSA_PORT_TYPE_DSA:
+		/* dp->index is used now as port_number. However
+		 * DSA ports should have separate numbering
+		 * independent from front panel port numbers.
+		 */
+		devlink_port_attrs_set(&dp->devlink_port,
+				       DEVLINK_PORT_FLAVOUR_DSA,
+				       dp->index, false, 0);
+		err = dsa_port_link_register_of(dp);
+		if (err) {
+			dev_err(ds->dev, "failed to setup link for port %d.%d\n",
+				ds->index, dp->index);
+			return err;
+		}
 		break;
 	case DSA_PORT_TYPE_USER:
+		devlink_port_attrs_set(&dp->devlink_port,
+				       DEVLINK_PORT_FLAVOUR_PHYSICAL,
+				       dp->index, false, 0);
 		err = dsa_slave_create(dp);
 		if (err)
 			dev_err(ds->dev, "failed to create slave for port %d.%d\n",
@@ -292,14 +319,15 @@ static int dsa_port_setup(struct dsa_port *dp)
 
 static void dsa_port_teardown(struct dsa_port *dp)
 {
-	devlink_port_unregister(&dp->devlink_port);
+	if (dp->type != DSA_PORT_TYPE_UNUSED)
+		devlink_port_unregister(&dp->devlink_port);
 
 	switch (dp->type) {
 	case DSA_PORT_TYPE_UNUSED:
 		break;
 	case DSA_PORT_TYPE_CPU:
 	case DSA_PORT_TYPE_DSA:
-		dsa_port_fixed_link_unregister_of(dp);
+		dsa_port_link_unregister_of(dp);
 		break;
 	case DSA_PORT_TYPE_USER:
 		if (dp->slave) {
@@ -747,6 +775,20 @@ struct dsa_switch *dsa_switch_alloc(struct device *dev, size_t n)
 	if (!ds)
 		return NULL;
 
+	/* We avoid allocating memory outside dsa_switch
+	 * if it is not needed.
+	 */
+	if (n <= sizeof(ds->_bitmap) * 8) {
+		ds->bitmap = &ds->_bitmap;
+	} else {
+		ds->bitmap = devm_kcalloc(dev,
+					  BITS_TO_LONGS(n),
+					  sizeof(unsigned long),
+					  GFP_KERNEL);
+		if (unlikely(!ds->bitmap))
+			return NULL;
+	}
+
 	ds->dev = dev;
 	ds->num_ports = n;
 
@@ -765,6 +807,7 @@ int dsa_register_switch(struct dsa_switch *ds)
 
 	mutex_lock(&dsa2_mutex);
 	err = dsa_switch_probe(ds);
+	dsa_tree_put(ds->dst);
 	mutex_unlock(&dsa2_mutex);
 
 	return err;

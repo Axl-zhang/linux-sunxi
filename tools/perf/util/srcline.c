@@ -85,6 +85,9 @@ static struct symbol *new_inline_sym(struct dso *dso,
 	struct symbol *inline_sym;
 	char *demangled = NULL;
 
+	if (!funcname)
+		funcname = "??";
+
 	if (dso) {
 		demangled = dso__demangle_sym(dso, 0, funcname);
 		if (demangled)
@@ -103,6 +106,7 @@ static struct symbol *new_inline_sym(struct dso *dso,
 		inline_sym = symbol__new(base_sym ? base_sym->start : 0,
 					 base_sym ? base_sym->end : 0,
 					 base_sym ? base_sym->binding : 0,
+					 base_sym ? base_sym->type : 0,
 					 funcname);
 		if (inline_sym)
 			inline_sym->inlined = 1;
@@ -496,7 +500,8 @@ out:
 #define A2L_FAIL_LIMIT 123
 
 char *__get_srcline(struct dso *dso, u64 addr, struct symbol *sym,
-		  bool show_sym, bool show_addr, bool unwind_inlines)
+		  bool show_sym, bool show_addr, bool unwind_inlines,
+		  u64 ip)
 {
 	char *file = NULL;
 	unsigned line = 0;
@@ -536,11 +541,39 @@ out:
 
 	if (sym) {
 		if (asprintf(&srcline, "%s+%" PRIu64, show_sym ? sym->name : "",
-					addr - sym->start) < 0)
+					ip - sym->start) < 0)
 			return SRCLINE_UNKNOWN;
 	} else if (asprintf(&srcline, "%s[%" PRIx64 "]", dso->short_name, addr) < 0)
 		return SRCLINE_UNKNOWN;
 	return srcline;
+}
+
+/* Returns filename and fills in line number in line */
+char *get_srcline_split(struct dso *dso, u64 addr, unsigned *line)
+{
+	char *file = NULL;
+	const char *dso_name;
+
+	if (!dso->has_srcline)
+		goto out;
+
+	dso_name = dso__name(dso);
+	if (dso_name == NULL)
+		goto out;
+
+	if (!addr2line(dso_name, addr, &file, line, dso, true, NULL, NULL))
+		goto out;
+
+	dso->a2l_fails = 0;
+	return file;
+
+out:
+	if (dso->a2l_fails && ++dso->a2l_fails > A2L_FAIL_LIMIT) {
+		dso->has_srcline = 0;
+		dso__free_a2l(dso);
+	}
+
+	return NULL;
 }
 
 void free_srcline(char *srcline)
@@ -550,9 +583,9 @@ void free_srcline(char *srcline)
 }
 
 char *get_srcline(struct dso *dso, u64 addr, struct symbol *sym,
-		  bool show_sym, bool show_addr)
+		  bool show_sym, bool show_addr, u64 ip)
 {
-	return __get_srcline(dso, addr, sym, show_sym, show_addr, false);
+	return __get_srcline(dso, addr, sym, show_sym, show_addr, false, ip);
 }
 
 struct srcline_node {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Linux driver for System z and s390 unit record devices
  * (z/VM virtual punch, reader, printer)
@@ -241,7 +242,7 @@ static struct ccw1 *alloc_chan_prog(const char __user *ubuf, int rec_count,
 	 * That means we allocate room for CCWs to cover count/reclen
 	 * records plus a NOP.
 	 */
-	cpa = kzalloc((rec_count + 1) * sizeof(struct ccw1),
+	cpa = kcalloc(rec_count + 1, sizeof(struct ccw1),
 		      GFP_KERNEL | GFP_DMA);
 	if (!cpa)
 		return ERR_PTR(-ENOMEM);

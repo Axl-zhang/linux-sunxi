@@ -40,11 +40,13 @@ config MACH_PXA3XX_DT
 
 config ARCH_LUBBOCK
 	bool "Intel DBPXA250 Development Platform (aka Lubbock)"
+	select GPIO_REG
 	select PXA25x
 	select SA1111
 
 config MACH_MAINSTONE
 	bool "Intel HCDDBBVA0 Development Platform (aka Mainstone)"
+	select GPIO_REG
 	select PXA27x
 
 config MACH_ZYLONITE
@@ -124,7 +126,7 @@ config MACH_ARMCORE
 	bool "CompuLab CM-X255/CM-X270 modules"
 	select ARCH_HAS_DMA_SET_COHERENT_MASK if PCI
 	select IWMMXT
-	select MIGHT_HAVE_PCI
+	select HAVE_PCI
 	select NEED_MACH_IO_H if PCI
 	select PXA25x
 	select PXA27x
@@ -550,7 +552,6 @@ config TOSA_BT
 config TOSA_USE_EXT_KEYCODES
 	bool "Tosa keyboard: use extended keycodes"
 	depends on MACH_TOSA
-	default n
 	help
 	  Say Y here to enable the tosa keyboard driver to generate extended
 	  (>= 127) keycodes. Be aware, that they can't be correctly interpreted

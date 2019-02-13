@@ -89,6 +89,8 @@ enum chain_value {
 	CCVAL_COUNT,
 };
 
+extern bool dwarf_callchain_users;
+
 struct callchain_param {
 	bool			enabled;
 	enum perf_call_graph_mode record_mode;
@@ -116,6 +118,7 @@ struct callchain_list {
 		bool		has_children;
 	};
 	u64			branch_count;
+	u64			from_count;
 	u64			predicted_count;
 	u64			abort_count;
 	u64			cycles_count;

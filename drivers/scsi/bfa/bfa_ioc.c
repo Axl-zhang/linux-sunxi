@@ -1809,13 +1809,12 @@ static void
 bfa_ioc_send_enable(struct bfa_ioc_s *ioc)
 {
 	struct bfi_ioc_ctrl_req_s enable_req;
-	struct timeval tv;
 
 	bfi_h2i_set(enable_req.mh, BFI_MC_IOC, BFI_IOC_H2I_ENABLE_REQ,
 		    bfa_ioc_portid(ioc));
 	enable_req.clscode = cpu_to_be16(ioc->clscode);
-	do_gettimeofday(&tv);
-	enable_req.tv_sec = be32_to_cpu(tv.tv_sec);
+	/* unsigned 32-bit time_t overflow in y2106 */
+	enable_req.tv_sec = be32_to_cpu(ktime_get_real_seconds());
 	bfa_ioc_mbox_send(ioc, &enable_req, sizeof(struct bfi_ioc_ctrl_req_s));
 }
 
@@ -1826,6 +1825,9 @@ bfa_ioc_send_disable(struct bfa_ioc_s *ioc)
 
 	bfi_h2i_set(disable_req.mh, BFI_MC_IOC, BFI_IOC_H2I_DISABLE_REQ,
 		    bfa_ioc_portid(ioc));
+	disable_req.clscode = cpu_to_be16(ioc->clscode);
+	/* unsigned 32-bit time_t overflow in y2106 */
+	disable_req.tv_sec = be32_to_cpu(ktime_get_real_seconds());
 	bfa_ioc_mbox_send(ioc, &disable_req, sizeof(struct bfi_ioc_ctrl_req_s));
 }
 
@@ -2803,7 +2805,7 @@ void
 bfa_ioc_get_adapter_manufacturer(struct bfa_ioc_s *ioc, char *manufacturer)
 {
 	memset((void *)manufacturer, 0, BFA_ADAPTER_MFG_NAME_LEN);
-	strncpy(manufacturer, BFA_MFG_NAME, BFA_ADAPTER_MFG_NAME_LEN);
+	strlcpy(manufacturer, BFA_MFG_NAME, BFA_ADAPTER_MFG_NAME_LEN);
 }
 
 void
@@ -3817,7 +3819,7 @@ bfa_sfp_scn(struct bfa_sfp_s *sfp, struct bfi_mbmsg_s *msg)
 		sfp->state = BFA_SFP_STATE_REMOVED;
 		sfp->data_valid = 0;
 		bfa_sfp_scn_aen_post(sfp, rsp);
-		 break;
+		break;
 	case BFA_SFP_SCN_FAILED:
 		sfp->state = BFA_SFP_STATE_FAILED;
 		sfp->data_valid = 0;
@@ -5761,7 +5763,7 @@ bfa_phy_intr(void *phyarg, struct bfi_mbmsg_s *msg)
 				(struct bfa_phy_stats_s *) phy->ubuf;
 			bfa_phy_ntoh32((u32 *)stats, (u32 *)phy->dbuf_kva,
 				sizeof(struct bfa_phy_stats_s));
-				bfa_trc(phy, stats->status);
+			bfa_trc(phy, stats->status);
 		}
 
 		phy->status = status;

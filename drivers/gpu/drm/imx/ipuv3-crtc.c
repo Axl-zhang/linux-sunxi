@@ -1,30 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * i.MX IPUv3 Graphics driver
  *
  * Copyright (C) 2011 Sascha Hauer, Pengutronix
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
+#include <linux/clk.h>
 #include <linux/component.h>
-#include <linux/module.h>
-#include <linux/export.h>
 #include <linux/device.h>
+#include <linux/errno.h>
+#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <drm/drmP.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_crtc_helper.h>
-#include <linux/clk.h>
-#include <linux/errno.h>
-#include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_probe_helper.h>
 
 #include <video/imx-ipu-v3.h>
 #include "imx-drm.h"
@@ -35,7 +27,6 @@
 struct ipu_crtc {
 	struct device		*dev;
 	struct drm_crtc		base;
-	struct imx_drm_crtc	*imx_crtc;
 
 	/* plane[0] is the full plane, plane[1] is the partial plane */
 	struct ipu_plane	*plane[2];
@@ -213,7 +204,7 @@ static bool ipu_crtc_mode_fixup(struct drm_crtc *crtc,
 static int ipu_crtc_atomic_check(struct drm_crtc *crtc,
 				 struct drm_crtc_state *state)
 {
-	u32 primary_plane_mask = 1 << drm_plane_index(crtc->primary);
+	u32 primary_plane_mask = drm_plane_mask(crtc->primary);
 
 	if (state->active && (primary_plane_mask & state->plane_mask) == 0)
 		return -EINVAL;
@@ -225,7 +216,11 @@ static void ipu_crtc_atomic_begin(struct drm_crtc *crtc,
 				  struct drm_crtc_state *old_crtc_state)
 {
 	drm_crtc_vblank_on(crtc);
+}
 
+static void ipu_crtc_atomic_flush(struct drm_crtc *crtc,
+				  struct drm_crtc_state *old_crtc_state)
+{
 	spin_lock_irq(&crtc->dev->event_lock);
 	if (crtc->state->event) {
 		WARN_ON(drm_crtc_vblank_get(crtc));
@@ -293,6 +288,7 @@ static const struct drm_crtc_helper_funcs ipu_helper_funcs = {
 	.mode_set_nofb = ipu_crtc_mode_set_nofb,
 	.atomic_check = ipu_crtc_atomic_check,
 	.atomic_begin = ipu_crtc_atomic_begin,
+	.atomic_flush = ipu_crtc_atomic_flush,
 	.atomic_disable = ipu_crtc_atomic_disable,
 	.atomic_enable = ipu_crtc_atomic_enable,
 };

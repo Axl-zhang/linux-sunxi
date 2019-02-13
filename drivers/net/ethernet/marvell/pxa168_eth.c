@@ -557,9 +557,9 @@ static int init_hash_table(struct pxa168_eth_private *pep)
 	 * table is full.
 	 */
 	if (!pep->htpr) {
-		pep->htpr = dma_zalloc_coherent(pep->dev->dev.parent,
-						HASH_ADDR_TABLE_SIZE,
-						&pep->htpr_dma, GFP_KERNEL);
+		pep->htpr = dma_alloc_coherent(pep->dev->dev.parent,
+					       HASH_ADDR_TABLE_SIZE,
+					       &pep->htpr_dma, GFP_KERNEL);
 		if (!pep->htpr)
 			return -ENOMEM;
 	} else {
@@ -988,8 +988,8 @@ static int pxa168_init_phy(struct net_device *dev)
 	cmd.base.phy_address = pep->phy_addr;
 	cmd.base.speed = pep->phy_speed;
 	cmd.base.duplex = pep->phy_duplex;
-	ethtool_convert_legacy_u32_to_link_mode(cmd.link_modes.advertising,
-						PHY_BASIC_FEATURES);
+	bitmap_copy(cmd.link_modes.advertising, PHY_BASIC_FEATURES,
+		    __ETHTOOL_LINK_MODE_MASK_NBITS);
 	cmd.base.autoneg = AUTONEG_ENABLE;
 
 	if (cmd.base.speed != 0)
@@ -1044,9 +1044,9 @@ static int rxq_init(struct net_device *dev)
 	pep->rx_desc_count = 0;
 	size = pep->rx_ring_size * sizeof(struct rx_desc);
 	pep->rx_desc_area_size = size;
-	pep->p_rx_desc_area = dma_zalloc_coherent(pep->dev->dev.parent, size,
-						  &pep->rx_desc_dma,
-						  GFP_KERNEL);
+	pep->p_rx_desc_area = dma_alloc_coherent(pep->dev->dev.parent, size,
+						 &pep->rx_desc_dma,
+						 GFP_KERNEL);
 	if (!pep->p_rx_desc_area)
 		goto out;
 
@@ -1103,9 +1103,9 @@ static int txq_init(struct net_device *dev)
 	pep->tx_desc_count = 0;
 	size = pep->tx_ring_size * sizeof(struct tx_desc);
 	pep->tx_desc_area_size = size;
-	pep->p_tx_desc_area = dma_zalloc_coherent(pep->dev->dev.parent, size,
-						  &pep->tx_desc_dma,
-						  GFP_KERNEL);
+	pep->p_tx_desc_area = dma_alloc_coherent(pep->dev->dev.parent, size,
+						 &pep->tx_desc_dma,
+						 GFP_KERNEL);
 	if (!pep->p_tx_desc_area)
 		goto out;
 	/* Initialize the next_desc_ptr links in the Tx descriptors ring */
@@ -1260,7 +1260,8 @@ static int pxa168_rx_poll(struct napi_struct *napi, int budget)
 	return work_done;
 }
 
-static int pxa168_eth_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t
+pxa168_eth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pxa168_eth_private *pep = netdev_priv(dev);
 	struct net_device_stats *stats = &dev->stats;
@@ -1362,6 +1363,15 @@ static int pxa168_eth_do_ioctl(struct net_device *dev, struct ifreq *ifr,
 	return -EOPNOTSUPP;
 }
 
+#ifdef CONFIG_NET_POLL_CONTROLLER
+static void pxa168_eth_netpoll(struct net_device *dev)
+{
+	disable_irq(dev->irq);
+	pxa168_eth_int_handler(dev->irq, dev);
+	enable_irq(dev->irq);
+}
+#endif
+
 static void pxa168_get_drvinfo(struct net_device *dev,
 			       struct ethtool_drvinfo *info)
 {
@@ -1390,6 +1400,9 @@ static const struct net_device_ops pxa168_eth_netdev_ops = {
 	.ndo_do_ioctl		= pxa168_eth_do_ioctl,
 	.ndo_change_mtu		= pxa168_eth_change_mtu,
 	.ndo_tx_timeout		= pxa168_eth_tx_timeout,
+#ifdef CONFIG_NET_POLL_CONTROLLER
+	.ndo_poll_controller    = pxa168_eth_netpoll,
+#endif
 };
 
 static int pxa168_eth_probe(struct platform_device *pdev)

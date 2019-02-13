@@ -40,19 +40,22 @@
 #undef WARN_ON_ONCE
 #define WARN_ON_ONCE(x) WARN_ONCE((x), "%s", "WARN_ON_ONCE(" __stringify(x) ")")
 
-#define MISSING_CASE(x) WARN(1, "Missing switch case (%lu) in %s\n", \
-			     (long)(x), __func__)
+#define MISSING_CASE(x) WARN(1, "Missing case (%s == %ld)\n", \
+			     __stringify(x), (long)(x))
 
-#if GCC_VERSION >= 70000
-#define add_overflows(A, B) \
-	__builtin_add_overflow_p((A), (B), (typeof((A) + (B)))0)
+#if defined(GCC_VERSION) && GCC_VERSION >= 70000
+#define add_overflows_t(T, A, B) \
+	__builtin_add_overflow_p((A), (B), (T)0)
 #else
-#define add_overflows(A, B) ({ \
+#define add_overflows_t(T, A, B) ({ \
 	typeof(A) a = (A); \
 	typeof(B) b = (B); \
-	a + b < a; \
+	(T)(a + b) < a; \
 })
 #endif
+
+#define add_overflows(A, B) \
+	add_overflows_t(typeof((A) + (B)), (A), (B))
 
 #define range_overflows(start, size, max) ({ \
 	typeof(start) start__ = (start); \
@@ -68,7 +71,7 @@
 
 /* Note we don't consider signbits :| */
 #define overflows_type(x, T) \
-	(sizeof(x) > sizeof(T) && (x) >> (sizeof(T) * BITS_PER_BYTE))
+	(sizeof(x) > sizeof(T) && (x) >> BITS_PER_TYPE(T))
 
 #define ptr_mask_bits(ptr, n) ({					\
 	unsigned long __v = (unsigned long)(ptr);			\
@@ -83,8 +86,11 @@
 	(typeof(ptr))(__v & -BIT(n));					\
 })
 
-#define ptr_pack_bits(ptr, bits, n)					\
-	((typeof(ptr))((unsigned long)(ptr) | (bits)))
+#define ptr_pack_bits(ptr, bits, n) ({					\
+	unsigned long __bits = (bits);					\
+	GEM_BUG_ON(__bits & -BIT(n));					\
+	((typeof(ptr))((unsigned long)(ptr) | __bits));			\
+})
 
 #define page_mask_bits(ptr) ptr_mask_bits(ptr, PAGE_SHIFT)
 #define page_unmask_bits(ptr) ptr_unmask_bits(ptr, PAGE_SHIFT)
@@ -117,6 +123,12 @@ static inline u64 ptr_to_u64(const void *ptr)
 
 #include <linux/list.h>
 
+static inline int list_is_first(const struct list_head *list,
+				const struct list_head *head)
+{
+	return head->next == list;
+}
+
 static inline void __list_del_many(struct list_head *head,
 				   struct list_head *first)
 {
@@ -135,6 +147,21 @@ static inline void drain_delayed_work(struct delayed_work *dw)
 		while (flush_delayed_work(dw))
 			;
 	} while (delayed_work_pending(dw));
+}
+
+static inline const char *yesno(bool v)
+{
+	return v ? "yes" : "no";
+}
+
+static inline const char *onoff(bool v)
+{
+	return v ? "on" : "off";
+}
+
+static inline const char *enableddisabled(bool v)
+{
+	return v ? "enabled" : "disabled";
 }
 
 #endif /* !__I915_UTILS_H */

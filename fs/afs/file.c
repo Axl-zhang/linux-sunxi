@@ -17,6 +17,7 @@
 #include <linux/writeback.h>
 #include <linux/gfp.h>
 #include <linux/task_io_accounting_ops.h>
+#include <linux/mm.h>
 #include "internal.h"
 
 static int afs_file_mmap(struct file *file, struct vm_area_struct *vma);
@@ -30,7 +31,6 @@ static int afs_readpages(struct file *filp, struct address_space *mapping,
 
 const struct file_operations afs_file_operations = {
 	.open		= afs_open,
-	.flush		= afs_flush,
 	.release	= afs_release,
 	.llseek		= generic_file_llseek,
 	.read_iter	= generic_file_read_iter,
@@ -122,7 +122,7 @@ int afs_open(struct inode *inode, struct file *file)
 	struct key *key;
 	int ret;
 
-	_enter("{%x:%u},", vnode->fid.vid, vnode->fid.vnode);
+	_enter("{%llx:%llu},", vnode->fid.vid, vnode->fid.vnode);
 
 	key = afs_request_key(vnode->volume->cell);
 	if (IS_ERR(key)) {
@@ -146,6 +146,9 @@ int afs_open(struct inode *inode, struct file *file)
 		if (ret < 0)
 			goto error_af;
 	}
+
+	if (file->f_flags & O_TRUNC)
+		set_bit(AFS_VNODE_NEW_CONTENT, &vnode->flags);
 	
 	file->private_data = af;
 	_leave(" = 0");
@@ -168,7 +171,10 @@ int afs_release(struct inode *inode, struct file *file)
 	struct afs_vnode *vnode = AFS_FS_I(inode);
 	struct afs_file *af = file->private_data;
 
-	_enter("{%x:%u},", vnode->fid.vid, vnode->fid.vnode);
+	_enter("{%llx:%llu},", vnode->fid.vid, vnode->fid.vnode);
+
+	if ((file->f_mode & FMODE_WRITE))
+		return vfs_fsync(file, 0);
 
 	file->private_data = NULL;
 	if (af->wb)
@@ -187,10 +193,12 @@ void afs_put_read(struct afs_read *req)
 {
 	int i;
 
-	if (atomic_dec_and_test(&req->usage)) {
+	if (refcount_dec_and_test(&req->usage)) {
 		for (i = 0; i < req->nr_pages; i++)
 			if (req->pages[i])
 				put_page(req->pages[i]);
+		if (req->pages != req->array)
+			kfree(req->pages);
 		kfree(req);
 	}
 }
@@ -221,7 +229,7 @@ int afs_fetch_data(struct afs_vnode *vnode, struct key *key, struct afs_read *de
 	struct afs_fs_cursor fc;
 	int ret;
 
-	_enter("%s{%x:%u.%u},%x,,,",
+	_enter("%s{%llx:%llu.%u},%x,,,",
 	       vnode->volume->name,
 	       vnode->fid.vid,
 	       vnode->fid.vnode,
@@ -231,13 +239,19 @@ int afs_fetch_data(struct afs_vnode *vnode, struct key *key, struct afs_read *de
 	ret = -ERESTARTSYS;
 	if (afs_begin_vnode_operation(&fc, vnode, key)) {
 		while (afs_select_fileserver(&fc)) {
-			fc.cb_break = vnode->cb_break + vnode->cb_s_break;
+			fc.cb_break = afs_calc_vnode_cb_break(vnode);
 			afs_fs_fetch_data(&fc, desc);
 		}
 
 		afs_check_for_remote_deletion(&fc, fc.vnode);
 		afs_vnode_commit_status(&fc, vnode, fc.cb_break);
 		ret = afs_end_vnode_operation(&fc);
+	}
+
+	if (ret == 0) {
+		afs_stat_v(vnode, n_fetches);
+		atomic_long_add(desc->actual_len,
+				&afs_v2net(vnode)->n_fetch_bytes);
 	}
 
 	_leave(" = %d", ret);
@@ -297,10 +311,11 @@ int afs_page_filler(void *data, struct page *page)
 		 * end of the file, the server will return a short read and the
 		 * unmarshalling code will clear the unfilled space.
 		 */
-		atomic_set(&req->usage, 1);
+		refcount_set(&req->usage, 1);
 		req->pos = (loff_t)page->index << PAGE_SHIFT;
 		req->len = PAGE_SIZE;
 		req->nr_pages = 1;
+		req->pages = req->array;
 		req->pages[0] = page;
 		get_page(page);
 
@@ -308,10 +323,6 @@ int afs_page_filler(void *data, struct page *page)
 		 * page */
 		ret = afs_fetch_data(vnode, key, req);
 		afs_put_read(req);
-
-		if (ret >= 0 && S_ISDIR(inode->i_mode) &&
-		    !afs_dir_check_page(inode, page))
-			ret = -EIO;
 
 		if (ret < 0) {
 			if (ret == -ENOENT) {
@@ -339,7 +350,8 @@ int afs_page_filler(void *data, struct page *page)
 		/* send the page to the cache */
 #ifdef CONFIG_AFS_FSCACHE
 		if (PageFsCache(page) &&
-		    fscache_write_page(vnode->cache, page, GFP_KERNEL) != 0) {
+		    fscache_write_page(vnode->cache, page, vnode->status.size,
+				       GFP_KERNEL) != 0) {
 			fscache_uncache_page(vnode->cache, page);
 			BUG_ON(PageFsCache(page));
 		}
@@ -403,7 +415,8 @@ static void afs_readpages_page_done(struct afs_call *call, struct afs_read *req)
 	/* send the page to the cache */
 #ifdef CONFIG_AFS_FSCACHE
 	if (PageFsCache(page) &&
-	    fscache_write_page(vnode->cache, page, GFP_KERNEL) != 0) {
+	    fscache_write_page(vnode->cache, page, vnode->status.size,
+			       GFP_KERNEL) != 0) {
 		fscache_uncache_page(vnode->cache, page);
 		BUG_ON(PageFsCache(page));
 	}
@@ -429,7 +442,7 @@ static int afs_readpages_one(struct file *file, struct address_space *mapping,
 	/* Count the number of contiguous pages at the front of the list.  Note
 	 * that the list goes prev-wards rather than next-wards.
 	 */
-	first = list_entry(pages->prev, struct page, lru);
+	first = lru_to_page(pages);
 	index = first->index + 1;
 	n = 1;
 	for (p = first->lru.prev; p != pages; p = p->prev) {
@@ -445,10 +458,11 @@ static int afs_readpages_one(struct file *file, struct address_space *mapping,
 	if (!req)
 		return -ENOMEM;
 
-	atomic_set(&req->usage, 1);
+	refcount_set(&req->usage, 1);
 	req->page_done = afs_readpages_page_done;
 	req->pos = first->index;
 	req->pos <<= PAGE_SHIFT;
+	req->pages = req->array;
 
 	/* Transfer the pages to the request.  We add them in until one fails
 	 * to add to the LRU and then we stop (as that'll make a hole in the
@@ -460,7 +474,7 @@ static int afs_readpages_one(struct file *file, struct address_space *mapping,
 	 * page at the end of the file.
 	 */
 	do {
-		page = list_entry(pages->prev, struct page, lru);
+		page = lru_to_page(pages);
 		list_del(&page->lru);
 		index = page->index;
 		if (add_to_page_cache_lru(page, mapping, index,
@@ -621,7 +635,7 @@ static int afs_releasepage(struct page *page, gfp_t gfp_flags)
 	struct afs_vnode *vnode = AFS_FS_I(page->mapping->host);
 	unsigned long priv;
 
-	_enter("{{%x:%u}[%lu],%lx},%x",
+	_enter("{{%llx:%llu}[%lu],%lx},%x",
 	       vnode->fid.vid, vnode->fid.vnode, page->index, page->flags,
 	       gfp_flags);
 

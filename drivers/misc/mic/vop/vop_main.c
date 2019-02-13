@@ -129,6 +129,16 @@ static u64 vop_get_features(struct virtio_device *vdev)
 	return features;
 }
 
+static void vop_transport_features(struct virtio_device *vdev)
+{
+	/*
+	 * Packed ring isn't enabled on virtio_vop for now,
+	 * because virtio_vop uses vring_new_virtqueue() which
+	 * creates virtio rings on preallocated memory.
+	 */
+	__virtio_clear_bit(vdev, VIRTIO_F_RING_PACKED);
+}
+
 static int vop_finalize_features(struct virtio_device *vdev)
 {
 	unsigned int i, bits;
@@ -140,6 +150,9 @@ static int vop_finalize_features(struct virtio_device *vdev)
 
 	/* Give virtio_ring a chance to accept features. */
 	vring_transport_features(vdev);
+
+	/* Give virtio_vop a chance to accept features. */
+	vop_transport_features(vdev);
 
 	memset_io(out_features, 0, feature_len);
 	bits = min_t(unsigned, feature_len,
@@ -381,16 +394,21 @@ static int vop_find_vqs(struct virtio_device *dev, unsigned nvqs,
 	struct _vop_vdev *vdev = to_vopvdev(dev);
 	struct vop_device *vpdev = vdev->vpdev;
 	struct mic_device_ctrl __iomem *dc = vdev->dc;
-	int i, err, retry;
+	int i, err, retry, queue_idx = 0;
 
 	/* We must have this many virtqueues. */
 	if (nvqs > ioread8(&vdev->desc->num_vq))
 		return -ENOENT;
 
 	for (i = 0; i < nvqs; ++i) {
+		if (!names[i]) {
+			vqs[i] = NULL;
+			continue;
+		}
+
 		dev_dbg(_vop_dev(vdev), "%s: %d: %s\n",
 			__func__, i, names[i]);
-		vqs[i] = vop_find_vq(dev, i, callbacks[i], names[i],
+		vqs[i] = vop_find_vq(dev, queue_idx++, callbacks[i], names[i],
 				     ctx ? ctx[i] : false);
 		if (IS_ERR(vqs[i])) {
 			err = PTR_ERR(vqs[i]);
@@ -452,10 +470,12 @@ static irqreturn_t vop_virtio_intr_handler(int irq, void *data)
 
 static void vop_virtio_release_dev(struct device *_d)
 {
-	/*
-	 * No need for a release method similar to virtio PCI.
-	 * Provide an empty one to avoid getting a warning from core.
-	 */
+	struct virtio_device *vdev =
+			container_of(_d, struct virtio_device, dev);
+	struct _vop_vdev *vop_vdev =
+			container_of(vdev, struct _vop_vdev, vdev);
+
+	kfree(vop_vdev);
 }
 
 /*
@@ -466,7 +486,7 @@ static int _vop_add_device(struct mic_device_desc __iomem *d,
 			   unsigned int offset, struct vop_device *vpdev,
 			   int dnode)
 {
-	struct _vop_vdev *vdev;
+	struct _vop_vdev *vdev, *reg_dev = NULL;
 	int ret;
 	u8 type = ioread8(&d->type);
 
@@ -497,6 +517,7 @@ static int _vop_add_device(struct mic_device_desc __iomem *d,
 	vdev->c2h_vdev_db = ioread8(&vdev->dc->c2h_vdev_db);
 
 	ret = register_virtio_device(&vdev->vdev);
+	reg_dev = vdev;
 	if (ret) {
 		dev_err(_vop_dev(vdev),
 			"Failed to register vop device %u type %u\n",
@@ -512,7 +533,10 @@ static int _vop_add_device(struct mic_device_desc __iomem *d,
 free_irq:
 	vpdev->hw_ops->free_irq(vpdev, vdev->virtio_cookie, vdev);
 kfree:
-	kfree(vdev);
+	if (reg_dev)
+		put_device(&vdev->vdev.dev);
+	else
+		kfree(vdev);
 	return ret;
 }
 
@@ -568,7 +592,7 @@ static int _vop_remove_device(struct mic_device_desc __iomem *d,
 		iowrite8(-1, &dc->h2c_vdev_db);
 		if (status & VIRTIO_CONFIG_S_DRIVER_OK)
 			wait_for_completion(&vdev->reset_done);
-		kfree(vdev);
+		put_device(&vdev->vdev.dev);
 		iowrite8(1, &dc->guest_ack);
 		dev_dbg(&vpdev->dev, "%s %d guest_ack %d\n",
 			__func__, __LINE__, ioread8(&dc->guest_ack));

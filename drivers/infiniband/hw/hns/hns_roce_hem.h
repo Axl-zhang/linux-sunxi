@@ -48,6 +48,8 @@ enum {
 	 /* UNMAP HEM */
 	HEM_TYPE_MTT,
 	HEM_TYPE_CQE,
+	HEM_TYPE_SRQWQE,
+	HEM_TYPE_IDX,
 	HEM_TYPE_IRRL,
 	HEM_TYPE_TRRL,
 };
@@ -78,6 +80,7 @@ struct hns_roce_hem_chunk {
 	int			 npages;
 	int			 nsg;
 	struct scatterlist	 mem[HNS_ROCE_HEM_CHUNK_LEN];
+	void			 *buf[HNS_ROCE_HEM_CHUNK_LEN];
 };
 
 struct hns_roce_hem {

@@ -42,7 +42,7 @@ static void __iomem *__ioremap_caller(phys_addr_t addr, size_t size,
 
 	/* Page-align mappings */
 	offset = addr & (~PAGE_MASK);
-	addr &= PAGE_MASK;
+	addr -= offset;
 	size = PAGE_ALIGN(size + offset);
 
 	area = get_vm_area_caller(size, VM_IOREMAP, caller);
@@ -85,7 +85,7 @@ EXPORT_SYMBOL(ioremap);
  *
  * Caller must ensure there is only one unmapping for the same pointer.
  */
-void iounmap(void __iomem *addr)
+void iounmap(volatile void __iomem *addr)
 {
 	vunmap((void *)((unsigned long)addr & PAGE_MASK));
 }

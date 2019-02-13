@@ -23,6 +23,9 @@
  *
  */
 
+/* The caprices of the preprocessor require that this be declared right here */
+#define CREATE_TRACE_POINTS
+
 #include "dm_services_types.h"
 #include "dc.h"
 #include "dc/inc/core_types.h"
@@ -30,6 +33,7 @@
 #include "vid.h"
 #include "amdgpu.h"
 #include "amdgpu_display.h"
+#include "amdgpu_ucode.h"
 #include "atom.h"
 #include "amdgpu_dm.h"
 #include "amdgpu_pm.h"
@@ -37,8 +41,10 @@
 #include "amd_shared.h"
 #include "amdgpu_dm_irq.h"
 #include "dm_helpers.h"
-#include "dm_services_types.h"
 #include "amdgpu_dm_mst_types.h"
+#if defined(CONFIG_DEBUG_FS)
+#include "amdgpu_dm_debugfs.h"
+#endif
 
 #include "ivsrcid/ivsrcid_vislands30.h"
 
@@ -46,35 +52,51 @@
 #include <linux/moduleparam.h>
 #include <linux/version.h>
 #include <linux/types.h>
+#include <linux/pm_runtime.h>
+#include <linux/firmware.h>
 
 #include <drm/drmP.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_dp_mst_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_edid.h>
 
-#include "modules/inc/mod_freesync.h"
-
 #if defined(CONFIG_DRM_AMD_DC_DCN1_0)
 #include "ivsrcid/irqsrcs_dcn_1_0.h"
 
-#include "raven1/DCN/dcn_1_0_offset.h"
-#include "raven1/DCN/dcn_1_0_sh_mask.h"
-#include "vega10/soc15ip.h"
+#include "dcn/dcn_1_0_offset.h"
+#include "dcn/dcn_1_0_sh_mask.h"
+#include "soc15_hw_ip.h"
+#include "vega10_ip_offset.h"
 
 #include "soc15_common.h"
 #endif
 
 #include "modules/inc/mod_freesync.h"
+#include "modules/power/power_helpers.h"
+#include "modules/inc/mod_info_packet.h"
 
-#include "i2caux_interface.h"
+#define FIRMWARE_RAVEN_DMCU		"amdgpu/raven_dmcu.bin"
+MODULE_FIRMWARE(FIRMWARE_RAVEN_DMCU);
+
+/**
+ * DOC: overview
+ *
+ * The AMDgpu display manager, **amdgpu_dm** (or even simpler,
+ * **dm**) sits between DRM and DC. It acts as a liason, converting DRM
+ * requests into DC requests, and DC responses into DRM responses.
+ *
+ * The root control structure is &struct amdgpu_display_manager.
+ */
 
 /* basic init/fini API */
 static int amdgpu_dm_init(struct amdgpu_device *adev);
 static void amdgpu_dm_fini(struct amdgpu_device *adev);
 
-/* initializes drm_device display related structures, based on the information
+/*
+ * initializes drm_device display related structures, based on the information
  * provided by DAL. The drm strcutures are: drm_crtc, drm_connector,
  * drm_encoder, drm_mode_config
  *
@@ -88,7 +110,7 @@ static void
 amdgpu_dm_update_connector_after_detect(struct amdgpu_dm_connector *aconnector);
 
 static int amdgpu_dm_plane_init(struct amdgpu_display_manager *dm,
-				struct amdgpu_plane *aplane,
+				struct drm_plane *plane,
 				unsigned long possible_crtcs);
 static int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
 			       struct drm_plane *plane,
@@ -112,6 +134,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state);
 static int amdgpu_dm_atomic_check(struct drm_device *dev,
 				  struct drm_atomic_state *state);
 
+static void handle_cursor_update(struct drm_plane *plane,
+				 struct drm_plane_state *old_plane_state);
 
 
 
@@ -236,10 +260,6 @@ get_crtc_by_otg_inst(struct amdgpu_device *adev,
 	struct drm_crtc *crtc;
 	struct amdgpu_crtc *amdgpu_crtc;
 
-	/*
-	 * following if is check inherited from both functions where this one is
-	 * used now. Need to be checked why it could happen.
-	 */
 	if (otg_inst == -1) {
 		WARN_ON(1);
 		return adev->mode_info.crtcs[0];
@@ -265,7 +285,7 @@ static void dm_pflip_high_irq(void *interrupt_params)
 	amdgpu_crtc = get_crtc_by_otg_inst(adev, irq_params->irq_src - IRQ_TYPE_PFLIP);
 
 	/* IRQ could occur when in initial stage */
-	/*TODO work and BO cleanup */
+	/* TODO work and BO cleanup */
 	if (amdgpu_crtc == NULL) {
 		DRM_DEBUG_DRIVER("CRTC is null, returning.\n");
 		return;
@@ -284,9 +304,9 @@ static void dm_pflip_high_irq(void *interrupt_params)
 	}
 
 
-	/* wakeup usersapce */
+	/* wake up userspace */
 	if (amdgpu_crtc->event) {
-		/* Update to correct count/ts if racing with vblank irq */
+		/* Update to correct count(s) if racing with vblank irq */
 		drm_crtc_accurate_vblank_count(&amdgpu_crtc->base);
 
 		drm_crtc_send_vblank_event(&amdgpu_crtc->base, amdgpu_crtc->event);
@@ -310,15 +330,31 @@ static void dm_crtc_high_irq(void *interrupt_params)
 {
 	struct common_irq_params *irq_params = interrupt_params;
 	struct amdgpu_device *adev = irq_params->adev;
-	uint8_t crtc_index = 0;
 	struct amdgpu_crtc *acrtc;
+	struct dm_crtc_state *acrtc_state;
 
 	acrtc = get_crtc_by_otg_inst(adev, irq_params->irq_src - IRQ_TYPE_VBLANK);
 
-	if (acrtc)
-		crtc_index = acrtc->crtc_id;
+	if (acrtc) {
+		drm_crtc_handle_vblank(&acrtc->base);
+		amdgpu_dm_crtc_handle_crc_irq(&acrtc->base);
 
-	drm_handle_vblank(adev->ddev, crtc_index);
+		acrtc_state = to_dm_crtc_state(acrtc->base.state);
+
+		if (acrtc_state->stream &&
+		    acrtc_state->vrr_params.supported &&
+		    acrtc_state->freesync_config.state == VRR_STATE_ACTIVE_VARIABLE) {
+			mod_freesync_handle_v_update(
+				adev->dm.freesync_module,
+				acrtc_state->stream,
+				&acrtc_state->vrr_params);
+
+			dc_stream_adjust_vmin_vmax(
+				adev->dm.dc,
+				acrtc_state->stream,
+				&acrtc_state->vrr_params.adjust);
+		}
+	}
 }
 
 static int dm_set_clockgating_state(void *handle,
@@ -336,42 +372,47 @@ static int dm_set_powergating_state(void *handle,
 /* Prototypes of private functions */
 static int dm_early_init(void* handle);
 
-static void hotplug_notify_work_func(struct work_struct *work)
-{
-	struct amdgpu_display_manager *dm = container_of(work, struct amdgpu_display_manager, mst_hotplug_work);
-	struct drm_device *dev = dm->ddev;
-
-	drm_kms_helper_hotplug_event(dev);
-}
-
-#if defined(CONFIG_DRM_AMD_DC_FBC)
-#include "dal_asic_id.h"
 /* Allocate memory for FBC compressed data  */
-/* TODO: Dynamic allocation */
-#define AMDGPU_FBC_SIZE    (3840 * 2160 * 4)
-
-static void amdgpu_dm_initialize_fbc(struct amdgpu_device *adev)
+static void amdgpu_dm_fbc_init(struct drm_connector *connector)
 {
-	int r;
+	struct drm_device *dev = connector->dev;
+	struct amdgpu_device *adev = dev->dev_private;
 	struct dm_comressor_info *compressor = &adev->dm.compressor;
+	struct amdgpu_dm_connector *aconn = to_amdgpu_dm_connector(connector);
+	struct drm_display_mode *mode;
+	unsigned long max_size = 0;
 
-	if (!compressor->bo_ptr) {
-		r = amdgpu_bo_create_kernel(adev, AMDGPU_FBC_SIZE, PAGE_SIZE,
-				AMDGPU_GEM_DOMAIN_VRAM, &compressor->bo_ptr,
-				&compressor->gpu_addr, &compressor->cpu_addr);
+	if (adev->dm.dc->fbc_compressor == NULL)
+		return;
+
+	if (aconn->dc_link->connector_signal != SIGNAL_TYPE_EDP)
+		return;
+
+	if (compressor->bo_ptr)
+		return;
+
+
+	list_for_each_entry(mode, &connector->modes, head) {
+		if (max_size < mode->htotal * mode->vtotal)
+			max_size = mode->htotal * mode->vtotal;
+	}
+
+	if (max_size) {
+		int r = amdgpu_bo_create_kernel(adev, max_size * 4, PAGE_SIZE,
+			    AMDGPU_GEM_DOMAIN_GTT, &compressor->bo_ptr,
+			    &compressor->gpu_addr, &compressor->cpu_addr);
 
 		if (r)
-			DRM_ERROR("DM: Failed to initialize fbc\n");
+			DRM_ERROR("DM: Failed to initialize FBC\n");
+		else {
+			adev->dm.dc->ctx->fbc_gpu_addr = compressor->gpu_addr;
+			DRM_INFO("DM: FBC alloc %lu\n", max_size*4);
+		}
+
 	}
 
 }
-#endif
 
-
-/* Init display KMS
- *
- * Returns 0 on success
- */
 static int amdgpu_dm_init(struct amdgpu_device *adev)
 {
 	struct dc_init_data init_data;
@@ -381,11 +422,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	/* Zero all the fields */
 	memset(&init_data, 0, sizeof(init_data));
 
-	/* initialize DAL's lock (for SYNC context use) */
-	spin_lock_init(&adev->dm.dal_lock);
-
-	/* initialize DAL's mutex */
-	mutex_init(&adev->dm.dal_mutex);
+	mutex_init(&adev->dm.dc_lock);
 
 	if(amdgpu_dm_irq_init(adev)) {
 		DRM_ERROR("amdgpu: failed to initialize DM IRQ support.\n");
@@ -397,7 +434,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	init_data.asic_id.pci_revision_id = adev->rev_id;
 	init_data.asic_id.hw_internal_rev = adev->external_rev_id;
 
-	init_data.asic_id.vram_width = adev->mc.vram_width;
+	init_data.asic_id.vram_width = adev->gmc.vram_width;
 	/* TODO: initialize init_data.asic_id.vram_type here!!!! */
 	init_data.asic_id.atombios_base_address =
 		adev->mode_info.atom_context->bios;
@@ -413,31 +450,28 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 
 	init_data.cgs_device = adev->dm.cgs_device;
 
-	adev->dm.dal = NULL;
-
 	init_data.dce_environment = DCE_ENV_PRODUCTION_DRV;
 
-	if (amdgpu_dc_log)
-		init_data.log_mask = DC_DEFAULT_LOG_MASK;
-	else
-		init_data.log_mask = DC_MIN_LOG_MASK;
+	/*
+	 * TODO debug why this doesn't work on Raven
+	 */
+	if (adev->flags & AMD_IS_APU &&
+	    adev->asic_type >= CHIP_CARRIZO &&
+	    adev->asic_type < CHIP_RAVEN)
+		init_data.flags.gpu_vm_support = true;
 
-#if defined(CONFIG_DRM_AMD_DC_FBC)
-	if (adev->family == FAMILY_CZ)
-		amdgpu_dm_initialize_fbc(adev);
-	init_data.fbc_gpu_addr = adev->dm.compressor.gpu_addr;
-#endif
+	if (amdgpu_dc_feature_mask & DC_FBC_MASK)
+		init_data.flags.fbc_support = true;
+
 	/* Display Core create. */
 	adev->dm.dc = dc_create(&init_data);
 
 	if (adev->dm.dc) {
-		DRM_INFO("Display Core initialized!\n");
+		DRM_INFO("Display Core initialized with v%s!\n", DC_VER);
 	} else {
-		DRM_INFO("Display Core failed to initialize!\n");
+		DRM_INFO("Display Core failed to initialize with v%s!\n", DC_VER);
 		goto error;
 	}
-
-	INIT_WORK(&adev->dm.mst_hotplug_work, hotplug_notify_work_func);
 
 	adev->dm.freesync_module = mod_freesync_create(adev->dm.dc);
 	if (!adev->dm.freesync_module) {
@@ -446,6 +480,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	} else
 		DRM_DEBUG_DRIVER("amdgpu: freesync_module init done %p.\n",
 				adev->dm.freesync_module);
+
+	amdgpu_dm_init_color_mod();
 
 	if (amdgpu_dm_initialize_drm_device(adev)) {
 		DRM_ERROR(
@@ -468,13 +504,18 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 		goto error;
 	}
 
+#if defined(CONFIG_DEBUG_FS)
+	if (dtn_debugfs_init(adev))
+		DRM_ERROR("amdgpu: failed initialize dtn debugfs support.\n");
+#endif
+
 	DRM_DEBUG_DRIVER("KMS initialized.\n");
 
 	return 0;
 error:
 	amdgpu_dm_fini(adev);
 
-	return -1;
+	return -EINVAL;
 }
 
 static void amdgpu_dm_fini(struct amdgpu_device *adev)
@@ -497,16 +538,105 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
 	/* DC Destroy TODO: Replace destroy DAL */
 	if (adev->dm.dc)
 		dc_destroy(&adev->dm.dc);
+
+	mutex_destroy(&adev->dm.dc_lock);
+
 	return;
+}
+
+static int load_dmcu_fw(struct amdgpu_device *adev)
+{
+	const char *fw_name_dmcu;
+	int r;
+	const struct dmcu_firmware_header_v1_0 *hdr;
+
+	switch(adev->asic_type) {
+	case CHIP_BONAIRE:
+	case CHIP_HAWAII:
+	case CHIP_KAVERI:
+	case CHIP_KABINI:
+	case CHIP_MULLINS:
+	case CHIP_TONGA:
+	case CHIP_FIJI:
+	case CHIP_CARRIZO:
+	case CHIP_STONEY:
+	case CHIP_POLARIS11:
+	case CHIP_POLARIS10:
+	case CHIP_POLARIS12:
+	case CHIP_VEGAM:
+	case CHIP_VEGA10:
+	case CHIP_VEGA12:
+	case CHIP_VEGA20:
+		return 0;
+	case CHIP_RAVEN:
+		fw_name_dmcu = FIRMWARE_RAVEN_DMCU;
+		break;
+	default:
+		DRM_ERROR("Unsupported ASIC type: 0x%X\n", adev->asic_type);
+		return -EINVAL;
+	}
+
+	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
+		DRM_DEBUG_KMS("dm: DMCU firmware not supported on direct or SMU loading\n");
+		return 0;
+	}
+
+	r = request_firmware_direct(&adev->dm.fw_dmcu, fw_name_dmcu, adev->dev);
+	if (r == -ENOENT) {
+		/* DMCU firmware is not necessary, so don't raise a fuss if it's missing */
+		DRM_DEBUG_KMS("dm: DMCU firmware not found\n");
+		adev->dm.fw_dmcu = NULL;
+		return 0;
+	}
+	if (r) {
+		dev_err(adev->dev, "amdgpu_dm: Can't load firmware \"%s\"\n",
+			fw_name_dmcu);
+		return r;
+	}
+
+	r = amdgpu_ucode_validate(adev->dm.fw_dmcu);
+	if (r) {
+		dev_err(adev->dev, "amdgpu_dm: Can't validate firmware \"%s\"\n",
+			fw_name_dmcu);
+		release_firmware(adev->dm.fw_dmcu);
+		adev->dm.fw_dmcu = NULL;
+		return r;
+	}
+
+	hdr = (const struct dmcu_firmware_header_v1_0 *)adev->dm.fw_dmcu->data;
+	adev->firmware.ucode[AMDGPU_UCODE_ID_DMCU_ERAM].ucode_id = AMDGPU_UCODE_ID_DMCU_ERAM;
+	adev->firmware.ucode[AMDGPU_UCODE_ID_DMCU_ERAM].fw = adev->dm.fw_dmcu;
+	adev->firmware.fw_size +=
+		ALIGN(le32_to_cpu(hdr->header.ucode_size_bytes) - le32_to_cpu(hdr->intv_size_bytes), PAGE_SIZE);
+
+	adev->firmware.ucode[AMDGPU_UCODE_ID_DMCU_INTV].ucode_id = AMDGPU_UCODE_ID_DMCU_INTV;
+	adev->firmware.ucode[AMDGPU_UCODE_ID_DMCU_INTV].fw = adev->dm.fw_dmcu;
+	adev->firmware.fw_size +=
+		ALIGN(le32_to_cpu(hdr->intv_size_bytes), PAGE_SIZE);
+
+	adev->dm.dmcu_fw_version = le32_to_cpu(hdr->header.ucode_version);
+
+	DRM_DEBUG_KMS("PSP loading DMCU firmware\n");
+
+	return 0;
 }
 
 static int dm_sw_init(void *handle)
 {
-	return 0;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	return load_dmcu_fw(adev);
 }
 
 static int dm_sw_fini(void *handle)
 {
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	if(adev->dm.fw_dmcu) {
+		release_firmware(adev->dm.fw_dmcu);
+		adev->dm.fw_dmcu = NULL;
+	}
+
 	return 0;
 }
 
@@ -520,7 +650,8 @@ static int detect_mst_link_for_all_connectors(struct drm_device *dev)
 
 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
 		aconnector = to_amdgpu_dm_connector(connector);
-		if (aconnector->dc_link->type == dc_connection_mst_branch) {
+		if (aconnector->dc_link->type == dc_connection_mst_branch &&
+		    aconnector->mst_mgr.aux) {
 			DRM_DEBUG_DRIVER("DM_MST: starting TM on aconnector: %p [id: %d]\n",
 					aconnector, aconnector->base.base.id);
 
@@ -539,33 +670,87 @@ static int detect_mst_link_for_all_connectors(struct drm_device *dev)
 
 static int dm_late_init(void *handle)
 {
-	struct drm_device *dev = ((struct amdgpu_device *)handle)->ddev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
-	return detect_mst_link_for_all_connectors(dev);
+	struct dmcu_iram_parameters params;
+	unsigned int linear_lut[16];
+	int i;
+	struct dmcu *dmcu = adev->dm.dc->res_pool->dmcu;
+	bool ret;
+
+	for (i = 0; i < 16; i++)
+		linear_lut[i] = 0xFFFF * i / 15;
+
+	params.set = 0;
+	params.backlight_ramping_start = 0xCCCC;
+	params.backlight_ramping_reduction = 0xCCCCCCCC;
+	params.backlight_lut_array_size = 16;
+	params.backlight_lut_array = linear_lut;
+
+	ret = dmcu_load_iram(dmcu, params);
+
+	if (!ret)
+		return -EINVAL;
+
+	return detect_mst_link_for_all_connectors(adev->ddev);
 }
 
 static void s3_handle_mst(struct drm_device *dev, bool suspend)
 {
 	struct amdgpu_dm_connector *aconnector;
 	struct drm_connector *connector;
+	struct drm_dp_mst_topology_mgr *mgr;
+	int ret;
+	bool need_hotplug = false;
 
 	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
 
-	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
-		   aconnector = to_amdgpu_dm_connector(connector);
-		   if (aconnector->dc_link->type == dc_connection_mst_branch &&
-				   !aconnector->mst_port) {
+	list_for_each_entry(connector, &dev->mode_config.connector_list,
+			    head) {
+		aconnector = to_amdgpu_dm_connector(connector);
+		if (aconnector->dc_link->type != dc_connection_mst_branch ||
+		    aconnector->mst_port)
+			continue;
 
-			   if (suspend)
-				   drm_dp_mst_topology_mgr_suspend(&aconnector->mst_mgr);
-			   else
-				   drm_dp_mst_topology_mgr_resume(&aconnector->mst_mgr);
-		   }
+		mgr = &aconnector->mst_mgr;
+
+		if (suspend) {
+			drm_dp_mst_topology_mgr_suspend(mgr);
+		} else {
+			ret = drm_dp_mst_topology_mgr_resume(mgr);
+			if (ret < 0) {
+				drm_dp_mst_topology_mgr_set_mst(mgr, false);
+				need_hotplug = true;
+			}
+		}
 	}
 
 	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+
+	if (need_hotplug)
+		drm_kms_helper_hotplug_event(dev);
 }
 
+/**
+ * dm_hw_init() - Initialize DC device
+ * @handle: The base driver device containing the amdpgu_dm device.
+ *
+ * Initialize the &struct amdgpu_display_manager device. This involves calling
+ * the initializers of each DM component, then populating the struct with them.
+ *
+ * Although the function implies hardware initialization, both hardware and
+ * software are initialized here. Splitting them out to their relevant init
+ * hooks is a future TODO item.
+ *
+ * Some notable things that are initialized here:
+ *
+ * - Display Core, both software and hardware
+ * - DC modules that we need (freesync and color management)
+ * - DRM software states
+ * - Interrupt sources and handlers
+ * - Vblank support
+ * - Debug FS entries, if enabled
+ */
 static int dm_hw_init(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
@@ -576,6 +761,14 @@ static int dm_hw_init(void *handle)
 	return 0;
 }
 
+/**
+ * dm_hw_fini() - Teardown DC device
+ * @handle: The base driver device containing the amdpgu_dm device.
+ *
+ * Teardown components within &struct amdgpu_display_manager that require
+ * cleanup. This involves cleaning up the DRM device, DC, and any modules that
+ * were loaded. Also flush IRQ workqueues and disable them.
+ */
 static int dm_hw_fini(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
@@ -624,19 +817,90 @@ amdgpu_dm_find_first_crtc_matching_connector(struct drm_atomic_state *state,
 	return NULL;
 }
 
+static void emulated_link_detect(struct dc_link *link)
+{
+	struct dc_sink_init_data sink_init_data = { 0 };
+	struct display_sink_capability sink_caps = { 0 };
+	enum dc_edid_status edid_status;
+	struct dc_context *dc_ctx = link->ctx;
+	struct dc_sink *sink = NULL;
+	struct dc_sink *prev_sink = NULL;
+
+	link->type = dc_connection_none;
+	prev_sink = link->local_sink;
+
+	if (prev_sink != NULL)
+		dc_sink_retain(prev_sink);
+
+	switch (link->connector_signal) {
+	case SIGNAL_TYPE_HDMI_TYPE_A: {
+		sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C;
+		sink_caps.signal = SIGNAL_TYPE_HDMI_TYPE_A;
+		break;
+	}
+
+	case SIGNAL_TYPE_DVI_SINGLE_LINK: {
+		sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C;
+		sink_caps.signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
+		break;
+	}
+
+	case SIGNAL_TYPE_DVI_DUAL_LINK: {
+		sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C;
+		sink_caps.signal = SIGNAL_TYPE_DVI_DUAL_LINK;
+		break;
+	}
+
+	case SIGNAL_TYPE_LVDS: {
+		sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C;
+		sink_caps.signal = SIGNAL_TYPE_LVDS;
+		break;
+	}
+
+	case SIGNAL_TYPE_EDP: {
+		sink_caps.transaction_type =
+			DDC_TRANSACTION_TYPE_I2C_OVER_AUX;
+		sink_caps.signal = SIGNAL_TYPE_EDP;
+		break;
+	}
+
+	case SIGNAL_TYPE_DISPLAY_PORT: {
+		sink_caps.transaction_type =
+			DDC_TRANSACTION_TYPE_I2C_OVER_AUX;
+		sink_caps.signal = SIGNAL_TYPE_VIRTUAL;
+		break;
+	}
+
+	default:
+		DC_ERROR("Invalid connector type! signal:%d\n",
+			link->connector_signal);
+		return;
+	}
+
+	sink_init_data.link = link;
+	sink_init_data.sink_signal = sink_caps.signal;
+
+	sink = dc_sink_create(&sink_init_data);
+	if (!sink) {
+		DC_ERROR("Failed to create sink!\n");
+		return;
+	}
+
+	link->local_sink = sink;
+
+	edid_status = dm_helpers_read_local_edid(
+			link->ctx,
+			link,
+			sink);
+
+	if (edid_status != EDID_OK)
+		DC_ERROR("Failed to read EDID");
+
+}
+
 static int dm_resume(void *handle)
 {
 	struct amdgpu_device *adev = handle;
-	struct amdgpu_display_manager *dm = &adev->dm;
-
-	/* power on hardware */
-	dc_set_power_state(dm->dc, DC_ACPI_CM_POWER_STATE_D0);
-
-	return 0;
-}
-
-int amdgpu_dm_display_resume(struct amdgpu_device *adev)
-{
 	struct drm_device *ddev = adev->ddev;
 	struct amdgpu_display_manager *dm = &adev->dm;
 	struct amdgpu_dm_connector *aconnector;
@@ -647,9 +911,11 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 	struct drm_plane *plane;
 	struct drm_plane_state *new_plane_state;
 	struct dm_plane_state *dm_new_plane_state;
-
-	int ret = 0;
+	enum dc_connection_type new_connection_type = dc_connection_none;
 	int i;
+
+	/* power on hardware */
+	dc_set_power_state(dm->dc, DC_ACPI_CM_POWER_STATE_D0);
 
 	/* program HPD filter */
 	dc_resume(dm->dc);
@@ -664,8 +930,7 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 	amdgpu_dm_irq_resume_early(adev);
 
 	/* Do detection*/
-	list_for_each_entry(connector,
-			&ddev->mode_config.connector_list, head) {
+	list_for_each_entry(connector, &ddev->mode_config.connector_list, head) {
 		aconnector = to_amdgpu_dm_connector(connector);
 
 		/*
@@ -676,14 +941,24 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 			continue;
 
 		mutex_lock(&aconnector->hpd_lock);
-		dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
+		if (!dc_link_detect_sink(aconnector->dc_link, &new_connection_type))
+			DRM_ERROR("KMS: Failed to detect connector\n");
+
+		if (aconnector->base.force && new_connection_type == dc_connection_none)
+			emulated_link_detect(aconnector->dc_link);
+		else
+			dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
+
+		if (aconnector->fake_enable && aconnector->dc_link->local_sink)
+			aconnector->fake_enable = false;
+
 		aconnector->dc_sink = NULL;
 		amdgpu_dm_update_connector_after_detect(aconnector);
 		mutex_unlock(&aconnector->hpd_lock);
 	}
 
-	/* Force mode set in atomic comit */
-	for_each_new_crtc_in_state(adev->dm.cached_state, crtc, new_crtc_state, i)
+	/* Force mode set in atomic commit */
+	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i)
 		new_crtc_state->active_changed = true;
 
 	/*
@@ -691,7 +966,7 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 	 * them here, since they were duplicated as part of the suspend
 	 * procedure.
 	 */
-	for_each_new_crtc_in_state(adev->dm.cached_state, crtc, new_crtc_state, i) {
+	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
 		if (dm_new_crtc_state->stream) {
 			WARN_ON(kref_read(&dm_new_crtc_state->stream->refcount) > 1);
@@ -700,7 +975,7 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 		}
 	}
 
-	for_each_new_plane_in_state(adev->dm.cached_state, plane, new_plane_state, i) {
+	for_each_new_plane_in_state(dm->cached_state, plane, new_plane_state, i) {
 		dm_new_plane_state = to_dm_plane_state(new_plane_state);
 		if (dm_new_plane_state->dc_state) {
 			WARN_ON(kref_read(&dm_new_plane_state->dc_state->refcount) > 1);
@@ -709,15 +984,24 @@ int amdgpu_dm_display_resume(struct amdgpu_device *adev)
 		}
 	}
 
-	ret = drm_atomic_helper_resume(ddev, adev->dm.cached_state);
+	drm_atomic_helper_resume(ddev, dm->cached_state);
 
-	drm_atomic_state_put(adev->dm.cached_state);
-	adev->dm.cached_state = NULL;
+	dm->cached_state = NULL;
 
 	amdgpu_dm_irq_resume_late(adev);
 
-	return ret;
+	return 0;
 }
+
+/**
+ * DOC: DM Lifecycle
+ *
+ * DM (and consequently DC) is registered in the amdgpu base driver as a IP
+ * block. When CONFIG_DRM_AMD_DC is enabled, the DM device IP block is added to
+ * the base driver's device list to be initialized and torn down accordingly.
+ *
+ * The functions to do so are provided as hooks in &struct amd_ip_funcs.
+ */
 
 static const struct amd_ip_funcs amdgpu_dm_funcs = {
 	.name = "dm",
@@ -747,53 +1031,17 @@ const struct amdgpu_ip_block_version dm_ip_block =
 };
 
 
-static struct drm_atomic_state *
-dm_atomic_state_alloc(struct drm_device *dev)
-{
-	struct dm_atomic_state *state = kzalloc(sizeof(*state), GFP_KERNEL);
-
-	if (!state)
-		return NULL;
-
-	if (drm_atomic_state_init(dev, &state->base) < 0)
-		goto fail;
-
-	return &state->base;
-
-fail:
-	kfree(state);
-	return NULL;
-}
-
-static void
-dm_atomic_state_clear(struct drm_atomic_state *state)
-{
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
-
-	if (dm_state->context) {
-		dc_release_state(dm_state->context);
-		dm_state->context = NULL;
-	}
-
-	drm_atomic_state_default_clear(state);
-}
-
-static void
-dm_atomic_state_alloc_free(struct drm_atomic_state *state)
-{
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
-	drm_atomic_state_default_release(state);
-	kfree(dm_state);
-}
+/**
+ * DOC: atomic
+ *
+ * *WIP*
+ */
 
 static const struct drm_mode_config_funcs amdgpu_dm_mode_funcs = {
-	.fb_create = amdgpu_user_framebuffer_create,
-	.output_poll_changed = amdgpu_output_poll_changed,
+	.fb_create = amdgpu_display_user_framebuffer_create,
+	.output_poll_changed = drm_fb_helper_output_poll_changed,
 	.atomic_check = amdgpu_dm_atomic_check,
 	.atomic_commit = amdgpu_dm_atomic_commit,
-	.atomic_state_alloc = dm_atomic_state_alloc,
-	.atomic_state_clear = dm_atomic_state_clear,
-	.atomic_state_free = dm_atomic_state_alloc_free
 };
 
 static struct drm_mode_config_helper_funcs amdgpu_dm_mode_config_helperfuncs = {
@@ -814,35 +1062,37 @@ amdgpu_dm_update_connector_after_detect(struct amdgpu_dm_connector *aconnector)
 
 	sink = aconnector->dc_link->local_sink;
 
-	/* Edid mgmt connector gets first update only in mode_valid hook and then
+	/*
+	 * Edid mgmt connector gets first update only in mode_valid hook and then
 	 * the connector sink is set to either fake or physical sink depends on link status.
-	 * don't do it here if u are during boot
+	 * Skip if already done during boot.
 	 */
 	if (aconnector->base.force != DRM_FORCE_UNSPECIFIED
 			&& aconnector->dc_em_sink) {
 
-		/* For S3 resume with headless use eml_sink to fake stream
-		 * because on resume connecotr->sink is set ti NULL
+		/*
+		 * For S3 resume with headless use eml_sink to fake stream
+		 * because on resume connector->sink is set to NULL
 		 */
 		mutex_lock(&dev->mode_config.mutex);
 
 		if (sink) {
 			if (aconnector->dc_sink) {
-				amdgpu_dm_remove_sink_from_freesync_module(
-								connector);
-				/* retain and release bellow are used for
-				 * bump up refcount for sink because the link don't point
-				 * to it anymore after disconnect so on next crtc to connector
+				amdgpu_dm_update_freesync_caps(connector, NULL);
+				/*
+				 * retain and release below are used to
+				 * bump up refcount for sink because the link doesn't point
+				 * to it anymore after disconnect, so on next crtc to connector
 				 * reshuffle by UMD we will get into unwanted dc_sink release
 				 */
 				if (aconnector->dc_sink != aconnector->dc_em_sink)
 					dc_sink_release(aconnector->dc_sink);
 			}
 			aconnector->dc_sink = sink;
-			amdgpu_dm_add_sink_to_freesync_module(
-						connector, aconnector->edid);
+			amdgpu_dm_update_freesync_caps(connector,
+					aconnector->edid);
 		} else {
-			amdgpu_dm_remove_sink_from_freesync_module(connector);
+			amdgpu_dm_update_freesync_caps(connector, NULL);
 			if (!aconnector->dc_sink)
 				aconnector->dc_sink = aconnector->dc_em_sink;
 			else if (aconnector->dc_sink != aconnector->dc_em_sink)
@@ -861,8 +1111,10 @@ amdgpu_dm_update_connector_after_detect(struct amdgpu_dm_connector *aconnector)
 		return;
 
 	if (aconnector->dc_sink == sink) {
-		/* We got a DP short pulse (Link Loss, DP CTS, etc...).
-		 * Do nothing!! */
+		/*
+		 * We got a DP short pulse (Link Loss, DP CTS, etc...).
+		 * Do nothing!!
+		 */
 		DRM_DEBUG_DRIVER("DCHPD: connector_id=%d: dc_sink didn't change.\n",
 				aconnector->connector_id);
 		return;
@@ -873,33 +1125,41 @@ amdgpu_dm_update_connector_after_detect(struct amdgpu_dm_connector *aconnector)
 
 	mutex_lock(&dev->mode_config.mutex);
 
-	/* 1. Update status of the drm connector
-	 * 2. Send an event and let userspace tell us what to do */
+	/*
+	 * 1. Update status of the drm connector
+	 * 2. Send an event and let userspace tell us what to do
+	 */
 	if (sink) {
-		/* TODO: check if we still need the S3 mode update workaround.
-		 * If yes, put it here. */
+		/*
+		 * TODO: check if we still need the S3 mode update workaround.
+		 * If yes, put it here.
+		 */
 		if (aconnector->dc_sink)
-			amdgpu_dm_remove_sink_from_freesync_module(
-							connector);
+			amdgpu_dm_update_freesync_caps(connector, NULL);
 
 		aconnector->dc_sink = sink;
 		if (sink->dc_edid.length == 0) {
 			aconnector->edid = NULL;
+			drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
 		} else {
 			aconnector->edid =
 				(struct edid *) sink->dc_edid.raw_edid;
 
 
-			drm_mode_connector_update_edid_property(connector,
+			drm_connector_update_edid_property(connector,
 					aconnector->edid);
+			drm_dp_cec_set_edid(&aconnector->dm_dp_aux.aux,
+					    aconnector->edid);
 		}
-		amdgpu_dm_add_sink_to_freesync_module(connector, aconnector->edid);
+		amdgpu_dm_update_freesync_caps(connector, aconnector->edid);
 
 	} else {
-		amdgpu_dm_remove_sink_from_freesync_module(connector);
-		drm_mode_connector_update_edid_property(connector, NULL);
+		drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
+		amdgpu_dm_update_freesync_caps(connector, NULL);
+		drm_connector_update_edid_property(connector, NULL);
 		aconnector->num_modes = 0;
 		aconnector->dc_sink = NULL;
+		aconnector->edid = NULL;
 	}
 
 	mutex_unlock(&dev->mode_config.mutex);
@@ -910,16 +1170,32 @@ static void handle_hpd_irq(void *param)
 	struct amdgpu_dm_connector *aconnector = (struct amdgpu_dm_connector *)param;
 	struct drm_connector *connector = &aconnector->base;
 	struct drm_device *dev = connector->dev;
+	enum dc_connection_type new_connection_type = dc_connection_none;
 
-	/* In case of failure or MST no need to update connector status or notify the OS
-	 * since (for MST case) MST does this in it's own context.
+	/*
+	 * In case of failure or MST no need to update connector status or notify the OS
+	 * since (for MST case) MST does this in its own context.
 	 */
 	mutex_lock(&aconnector->hpd_lock);
 
 	if (aconnector->fake_enable)
 		aconnector->fake_enable = false;
 
-	if (dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD)) {
+	if (!dc_link_detect_sink(aconnector->dc_link, &new_connection_type))
+		DRM_ERROR("KMS: Failed to detect connector\n");
+
+	if (aconnector->base.force && new_connection_type == dc_connection_none) {
+		emulated_link_detect(aconnector->dc_link);
+
+
+		drm_modeset_lock_all(dev);
+		dm_restore_drm_connector_state(dev, connector);
+		drm_modeset_unlock_all(dev);
+
+		if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+			drm_kms_helper_hotplug_event(dev);
+
+	} else if (dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD)) {
 		amdgpu_dm_update_connector_after_detect(aconnector);
 
 
@@ -995,7 +1271,7 @@ static void dm_handle_hpd_rx_irq(struct amdgpu_dm_connector *aconnector)
 					break;
 			}
 
-			/* check if there is new irq to be handle */
+			/* check if there is new irq to be handled */
 			dret = drm_dp_dpcd_read(
 				&aconnector->dm_dp_aux.aux,
 				dpcd_addr,
@@ -1019,18 +1295,41 @@ static void handle_hpd_rx_irq(void *param)
 	struct drm_device *dev = connector->dev;
 	struct dc_link *dc_link = aconnector->dc_link;
 	bool is_mst_root_connector = aconnector->mst_mgr.mst_state;
+	enum dc_connection_type new_connection_type = dc_connection_none;
 
-	/* TODO:Temporary add mutex to protect hpd interrupt not have a gpio
+	/*
+	 * TODO:Temporary add mutex to protect hpd interrupt not have a gpio
 	 * conflict, after implement i2c helper, this mutex should be
 	 * retired.
 	 */
 	if (dc_link->type != dc_connection_mst_branch)
 		mutex_lock(&aconnector->hpd_lock);
 
-	if (dc_link_handle_hpd_rx_irq(dc_link, NULL) &&
+	if (dc_link_handle_hpd_rx_irq(dc_link, NULL, NULL) &&
 			!is_mst_root_connector) {
 		/* Downstream Port status changed. */
-		if (dc_link_detect(dc_link, DETECT_REASON_HPDRX)) {
+		if (!dc_link_detect_sink(dc_link, &new_connection_type))
+			DRM_ERROR("KMS: Failed to detect connector\n");
+
+		if (aconnector->base.force && new_connection_type == dc_connection_none) {
+			emulated_link_detect(dc_link);
+
+			if (aconnector->fake_enable)
+				aconnector->fake_enable = false;
+
+			amdgpu_dm_update_connector_after_detect(aconnector);
+
+
+			drm_modeset_lock_all(dev);
+			dm_restore_drm_connector_state(dev, connector);
+			drm_modeset_unlock_all(dev);
+
+			drm_kms_helper_hotplug_event(dev);
+		} else if (dc_link_detect(dc_link, DETECT_REASON_HPDRX)) {
+
+			if (aconnector->fake_enable)
+				aconnector->fake_enable = false;
+
 			amdgpu_dm_update_connector_after_detect(aconnector);
 
 
@@ -1045,8 +1344,10 @@ static void handle_hpd_rx_irq(void *param)
 	    (dc_link->type == dc_connection_mst_branch))
 		dm_handle_hpd_rx_irq(aconnector);
 
-	if (dc_link->type != dc_connection_mst_branch)
+	if (dc_link->type != dc_connection_mst_branch) {
+		drm_dp_cec_irq(&aconnector->dm_dp_aux.aux);
 		mutex_unlock(&aconnector->hpd_lock);
+	}
 }
 
 static void register_hpd_handlers(struct amdgpu_device *adev)
@@ -1096,16 +1397,19 @@ static int dce110_register_irq_handlers(struct amdgpu_device *adev)
 	struct dc_interrupt_params int_params = {0};
 	int r;
 	int i;
-	unsigned client_id = AMDGPU_IH_CLIENTID_LEGACY;
+	unsigned client_id = AMDGPU_IRQ_CLIENTID_LEGACY;
 
 	if (adev->asic_type == CHIP_VEGA10 ||
+	    adev->asic_type == CHIP_VEGA12 ||
+	    adev->asic_type == CHIP_VEGA20 ||
 	    adev->asic_type == CHIP_RAVEN)
-		client_id = AMDGPU_IH_CLIENTID_DCE;
+		client_id = SOC15_IH_CLIENTID_DCE;
 
 	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
 	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
 
-	/* Actions of amdgpu_irq_add_id():
+	/*
+	 * Actions of amdgpu_irq_add_id():
 	 * 1. Register a set() function with base driver.
 	 *    Base driver will call set() function to enable/disable an
 	 *    interrupt in DC hardware.
@@ -1185,7 +1489,8 @@ static int dcn10_register_irq_handlers(struct amdgpu_device *adev)
 	int_params.requested_polarity = INTERRUPT_POLARITY_DEFAULT;
 	int_params.current_polarity = INTERRUPT_POLARITY_DEFAULT;
 
-	/* Actions of amdgpu_irq_add_id():
+	/*
+	 * Actions of amdgpu_irq_add_id():
 	 * 1. Register a set() function with base driver.
 	 *    Base driver will call set() function to enable/disable an
 	 *    interrupt in DC hardware.
@@ -1194,13 +1499,13 @@ static int dcn10_register_irq_handlers(struct amdgpu_device *adev)
 	 *    coming from DC hardware.
 	 *    amdgpu_dm_irq_handler() will re-direct the interrupt to DC
 	 *    for acknowledging and handling.
-	 * */
+	 */
 
 	/* Use VSTARTUP interrupt */
 	for (i = DCN_1_0__SRCID__DC_D1_OTG_VSTARTUP;
 			i <= DCN_1_0__SRCID__DC_D1_OTG_VSTARTUP + adev->mode_info.num_crtc - 1;
 			i++) {
-		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_DCE, i, &adev->crtc_irq);
+		r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_DCE, i, &adev->crtc_irq);
 
 		if (r) {
 			DRM_ERROR("Failed to add crtc irq id!\n");
@@ -1224,7 +1529,7 @@ static int dcn10_register_irq_handlers(struct amdgpu_device *adev)
 	for (i = DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT;
 			i <= DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT + adev->mode_info.num_crtc - 1;
 			i++) {
-		r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_DCE, i, &adev->pageflip_irq);
+		r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_DCE, i, &adev->pageflip_irq);
 		if (r) {
 			DRM_ERROR("Failed to add page flip irq id!\n");
 			return r;
@@ -1245,7 +1550,7 @@ static int dcn10_register_irq_handlers(struct amdgpu_device *adev)
 	}
 
 	/* HPD */
-	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_DCE, DCN_1_0__SRCID__DC_HPD1_INT,
+	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_DCE, DCN_1_0__SRCID__DC_HPD1_INT,
 			&adev->hpd_irq);
 	if (r) {
 		DRM_ERROR("Failed to add hpd irq id!\n");
@@ -1258,8 +1563,117 @@ static int dcn10_register_irq_handlers(struct amdgpu_device *adev)
 }
 #endif
 
+/*
+ * Acquires the lock for the atomic state object and returns
+ * the new atomic state.
+ *
+ * This should only be called during atomic check.
+ */
+static int dm_atomic_get_state(struct drm_atomic_state *state,
+			       struct dm_atomic_state **dm_state)
+{
+	struct drm_device *dev = state->dev;
+	struct amdgpu_device *adev = dev->dev_private;
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_private_state *priv_state;
+	int ret;
+
+	if (*dm_state)
+		return 0;
+
+	ret = drm_modeset_lock(&dm->atomic_obj_lock, state->acquire_ctx);
+	if (ret)
+		return ret;
+
+	priv_state = drm_atomic_get_private_obj_state(state, &dm->atomic_obj);
+	if (IS_ERR(priv_state))
+		return PTR_ERR(priv_state);
+
+	*dm_state = to_dm_atomic_state(priv_state);
+
+	return 0;
+}
+
+struct dm_atomic_state *
+dm_atomic_get_new_state(struct drm_atomic_state *state)
+{
+	struct drm_device *dev = state->dev;
+	struct amdgpu_device *adev = dev->dev_private;
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_private_obj *obj;
+	struct drm_private_state *new_obj_state;
+	int i;
+
+	for_each_new_private_obj_in_state(state, obj, new_obj_state, i) {
+		if (obj->funcs == dm->atomic_obj.funcs)
+			return to_dm_atomic_state(new_obj_state);
+	}
+
+	return NULL;
+}
+
+struct dm_atomic_state *
+dm_atomic_get_old_state(struct drm_atomic_state *state)
+{
+	struct drm_device *dev = state->dev;
+	struct amdgpu_device *adev = dev->dev_private;
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_private_obj *obj;
+	struct drm_private_state *old_obj_state;
+	int i;
+
+	for_each_old_private_obj_in_state(state, obj, old_obj_state, i) {
+		if (obj->funcs == dm->atomic_obj.funcs)
+			return to_dm_atomic_state(old_obj_state);
+	}
+
+	return NULL;
+}
+
+static struct drm_private_state *
+dm_atomic_duplicate_state(struct drm_private_obj *obj)
+{
+	struct dm_atomic_state *old_state, *new_state;
+
+	new_state = kzalloc(sizeof(*new_state), GFP_KERNEL);
+	if (!new_state)
+		return NULL;
+
+	__drm_atomic_helper_private_obj_duplicate_state(obj, &new_state->base);
+
+	new_state->context = dc_create_state();
+	if (!new_state->context) {
+		kfree(new_state);
+		return NULL;
+	}
+
+	old_state = to_dm_atomic_state(obj->state);
+	if (old_state && old_state->context)
+		dc_resource_state_copy_construct(old_state->context,
+						 new_state->context);
+
+	return &new_state->base;
+}
+
+static void dm_atomic_destroy_state(struct drm_private_obj *obj,
+				    struct drm_private_state *state)
+{
+	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
+
+	if (dm_state && dm_state->context)
+		dc_release_state(dm_state->context);
+
+	kfree(dm_state);
+}
+
+static struct drm_private_state_funcs dm_atomic_state_funcs = {
+	.atomic_duplicate_state = dm_atomic_duplicate_state,
+	.atomic_destroy_state = dm_atomic_destroy_state,
+};
+
 static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
 {
+	struct dm_atomic_state *state;
 	int r;
 
 	adev->mode_info.mode_config_initialized = true;
@@ -1272,27 +1686,94 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
 
 	adev->ddev->mode_config.preferred_depth = 24;
 	adev->ddev->mode_config.prefer_shadow = 1;
-	/* indicate support of immediate flip */
+	/* indicates support for immediate flip */
 	adev->ddev->mode_config.async_page_flip = true;
 
-	adev->ddev->mode_config.fb_base = adev->mc.aper_base;
+	adev->ddev->mode_config.fb_base = adev->gmc.aper_base;
 
-	r = amdgpu_modeset_create_props(adev);
+	drm_modeset_lock_init(&adev->dm.atomic_obj_lock);
+
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	state->context = dc_create_state();
+	if (!state->context) {
+		kfree(state);
+		return -ENOMEM;
+	}
+
+	dc_resource_state_copy_construct_current(adev->dm.dc, state->context);
+
+	drm_atomic_private_obj_init(adev->ddev,
+				    &adev->dm.atomic_obj,
+				    &state->base,
+				    &dm_atomic_state_funcs);
+
+	r = amdgpu_display_modeset_create_props(adev);
 	if (r)
 		return r;
 
 	return 0;
 }
 
+#define AMDGPU_DM_DEFAULT_MIN_BACKLIGHT 12
+#define AMDGPU_DM_DEFAULT_MAX_BACKLIGHT 255
+
 #if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) ||\
 	defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
+
+static void amdgpu_dm_update_backlight_caps(struct amdgpu_display_manager *dm)
+{
+#if defined(CONFIG_ACPI)
+	struct amdgpu_dm_backlight_caps caps;
+
+	if (dm->backlight_caps.caps_valid)
+		return;
+
+	amdgpu_acpi_get_backlight_caps(dm->adev, &caps);
+	if (caps.caps_valid) {
+		dm->backlight_caps.min_input_signal = caps.min_input_signal;
+		dm->backlight_caps.max_input_signal = caps.max_input_signal;
+		dm->backlight_caps.caps_valid = true;
+	} else {
+		dm->backlight_caps.min_input_signal =
+				AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+		dm->backlight_caps.max_input_signal =
+				AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
+	}
+#else
+	dm->backlight_caps.min_input_signal = AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+	dm->backlight_caps.max_input_signal = AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
+#endif
+}
 
 static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
 {
 	struct amdgpu_display_manager *dm = bl_get_data(bd);
+	struct amdgpu_dm_backlight_caps caps;
+	uint32_t brightness = bd->props.brightness;
+
+	amdgpu_dm_update_backlight_caps(dm);
+	caps = dm->backlight_caps;
+	/*
+	 * The brightness input is in the range 0-255
+	 * It needs to be rescaled to be between the
+	 * requested min and max input signal
+	 *
+	 * It also needs to be scaled up by 0x101 to
+	 * match the DC interface which has a range of
+	 * 0 to 0xffff
+	 */
+	brightness =
+		brightness
+		* 0x101
+		* (caps.max_input_signal - caps.min_input_signal)
+		/ AMDGPU_MAX_BL_LEVEL
+		+ caps.min_input_signal * 0x101;
 
 	if (dc_link_set_backlight_level(dm->backlight_link,
-			bd->props.brightness, 0, 0))
+			brightness, 0))
 		return 0;
 	else
 		return 1;
@@ -1300,7 +1781,12 @@ static int amdgpu_dm_backlight_update_status(struct backlight_device *bd)
 
 static int amdgpu_dm_backlight_get_brightness(struct backlight_device *bd)
 {
-	return bd->props.brightness;
+	struct amdgpu_display_manager *dm = bl_get_data(bd);
+	int ret = dc_link_get_backlight_level(dm->backlight_link);
+
+	if (ret == DC_ERROR_UNEXPECTED)
+		return bd->props.brightness;
+	return ret;
 }
 
 static const struct backlight_ops amdgpu_dm_backlight_ops = {
@@ -1314,7 +1800,10 @@ amdgpu_dm_register_backlight_device(struct amdgpu_display_manager *dm)
 	char bl_name[16];
 	struct backlight_properties props = { 0 };
 
+	amdgpu_dm_update_backlight_caps(dm);
+
 	props.max_brightness = AMDGPU_MAX_BL_LEVEL;
+	props.brightness = AMDGPU_MAX_BL_LEVEL;
 	props.type = BACKLIGHT_RAW;
 
 	snprintf(bl_name, sizeof(bl_name), "amdgpu_bl%d",
@@ -1334,7 +1823,68 @@ amdgpu_dm_register_backlight_device(struct amdgpu_display_manager *dm)
 
 #endif
 
-/* In this architecture, the association
+static int initialize_plane(struct amdgpu_display_manager *dm,
+			     struct amdgpu_mode_info *mode_info,
+			     int plane_id)
+{
+	struct drm_plane *plane;
+	unsigned long possible_crtcs;
+	int ret = 0;
+
+	plane = kzalloc(sizeof(struct drm_plane), GFP_KERNEL);
+	mode_info->planes[plane_id] = plane;
+
+	if (!plane) {
+		DRM_ERROR("KMS: Failed to allocate plane\n");
+		return -ENOMEM;
+	}
+	plane->type = mode_info->plane_type[plane_id];
+
+	/*
+	 * HACK: IGT tests expect that each plane can only have
+	 * one possible CRTC. For now, set one CRTC for each
+	 * plane that is not an underlay, but still allow multiple
+	 * CRTCs for underlay planes.
+	 */
+	possible_crtcs = 1 << plane_id;
+	if (plane_id >= dm->dc->caps.max_streams)
+		possible_crtcs = 0xff;
+
+	ret = amdgpu_dm_plane_init(dm, mode_info->planes[plane_id], possible_crtcs);
+
+	if (ret) {
+		DRM_ERROR("KMS: Failed to initialize plane\n");
+		return ret;
+	}
+
+	return ret;
+}
+
+
+static void register_backlight_device(struct amdgpu_display_manager *dm,
+				      struct dc_link *link)
+{
+#if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) ||\
+	defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
+
+	if ((link->connector_signal & (SIGNAL_TYPE_EDP | SIGNAL_TYPE_LVDS)) &&
+	    link->type != dc_connection_none) {
+		/*
+		 * Event if registration failed, we should continue with
+		 * DM initialization because not having a backlight control
+		 * is better then a black screen.
+		 */
+		amdgpu_dm_register_backlight_device(dm);
+
+		if (dm->backlight_dev)
+			dm->backlight_link = link;
+	}
+#endif
+}
+
+
+/*
+ * In this architecture, the association
  * connector -> encoder -> crtc
  * id not really requried. The crtc and connector will hold the
  * display_index as an abstraction to use with DAL component
@@ -1344,49 +1894,42 @@ amdgpu_dm_register_backlight_device(struct amdgpu_display_manager *dm)
 static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 {
 	struct amdgpu_display_manager *dm = &adev->dm;
-	uint32_t i;
+	int32_t i;
 	struct amdgpu_dm_connector *aconnector = NULL;
 	struct amdgpu_encoder *aencoder = NULL;
 	struct amdgpu_mode_info *mode_info = &adev->mode_info;
 	uint32_t link_cnt;
-	unsigned long possible_crtcs;
+	int32_t total_overlay_planes, total_primary_planes;
+	enum dc_connection_type new_connection_type = dc_connection_none;
 
 	link_cnt = dm->dc->caps.max_links;
 	if (amdgpu_dm_mode_config_init(dm->adev)) {
 		DRM_ERROR("DM: Failed to initialize mode config\n");
-		return -1;
+		return -EINVAL;
 	}
 
-	for (i = 0; i < dm->dc->caps.max_planes; i++) {
-		struct amdgpu_plane *plane;
+	/* Identify the number of planes to be initialized */
+	total_overlay_planes = dm->dc->caps.max_slave_planes;
+	total_primary_planes = dm->dc->caps.max_planes - dm->dc->caps.max_slave_planes;
 
-		plane = kzalloc(sizeof(struct amdgpu_plane), GFP_KERNEL);
-		mode_info->planes[i] = plane;
-
-		if (!plane) {
-			DRM_ERROR("KMS: Failed to allocate plane\n");
+	/* First initialize overlay planes, index starting after primary planes */
+	for (i = (total_overlay_planes - 1); i >= 0; i--) {
+		if (initialize_plane(dm, mode_info, (total_primary_planes + i))) {
+			DRM_ERROR("KMS: Failed to initialize overlay plane\n");
 			goto fail;
 		}
-		plane->base.type = mode_info->plane_type[i];
+	}
 
-		/*
-		 * HACK: IGT tests expect that each plane can only have one
-		 * one possible CRTC. For now, set one CRTC for each
-		 * plane that is not an underlay, but still allow multiple
-		 * CRTCs for underlay planes.
-		 */
-		possible_crtcs = 1 << i;
-		if (i >= dm->dc->caps.max_streams)
-			possible_crtcs = 0xff;
-
-		if (amdgpu_dm_plane_init(dm, mode_info->planes[i], possible_crtcs)) {
-			DRM_ERROR("KMS: Failed to initialize plane\n");
+	/* Initialize primary planes */
+	for (i = (total_primary_planes - 1); i >= 0; i--) {
+		if (initialize_plane(dm, mode_info, i)) {
+			DRM_ERROR("KMS: Failed to initialize primary plane\n");
 			goto fail;
 		}
 	}
 
 	for (i = 0; i < dm->dc->caps.max_streams; i++)
-		if (amdgpu_dm_crtc_init(dm, &mode_info->planes[i]->base, i)) {
+		if (amdgpu_dm_crtc_init(dm, mode_info->planes[i], i)) {
 			DRM_ERROR("KMS: Failed to initialize crtc\n");
 			goto fail;
 		}
@@ -1395,6 +1938,7 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 
 	/* loops over all connectors on the board */
 	for (i = 0; i < link_cnt; i++) {
+		struct dc_link *link = NULL;
 
 		if (i > AMDGPU_DM_MAX_DISPLAY_INDEX) {
 			DRM_ERROR(
@@ -1421,9 +1965,21 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 			goto fail;
 		}
 
-		if (dc_link_detect(dc_get_link_at_index(dm->dc, i),
-				DETECT_REASON_BOOT))
+		link = dc_get_link_at_index(dm->dc, i);
+
+		if (!dc_link_detect_sink(link, &new_connection_type))
+			DRM_ERROR("KMS: Failed to detect connector\n");
+
+		if (aconnector->base.force && new_connection_type == dc_connection_none) {
+			emulated_link_detect(link);
 			amdgpu_dm_update_connector_after_detect(aconnector);
+
+		} else if (dc_link_detect(link, DETECT_REASON_BOOT)) {
+			amdgpu_dm_update_connector_after_detect(aconnector);
+			register_backlight_device(dm, link);
+		}
+
+
 	}
 
 	/* Software is initialized. Now we can register interrupt handlers. */
@@ -1440,7 +1996,10 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS10:
 	case CHIP_POLARIS12:
+	case CHIP_VEGAM:
 	case CHIP_VEGA10:
+	case CHIP_VEGA12:
+	case CHIP_VEGA20:
 		if (dce110_register_irq_handlers(dm->adev)) {
 			DRM_ERROR("DM: Failed to initialize IRQ\n");
 			goto fail;
@@ -1452,16 +2011,15 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 			DRM_ERROR("DM: Failed to initialize IRQ\n");
 			goto fail;
 		}
-		/*
-		 * Temporary disable until pplib/smu interaction is implemented
-		 */
-		dm->dc->debug.disable_stutter = true;
 		break;
 #endif
 	default:
-		DRM_ERROR("Usupported ASIC type: 0x%X\n", adev->asic_type);
+		DRM_ERROR("Unsupported ASIC type: 0x%X\n", adev->asic_type);
 		goto fail;
 	}
+
+	if (adev->asic_type != CHIP_CARRIZO && adev->asic_type != CHIP_STONEY)
+		dm->dc->debug.disable_stutter = amdgpu_pp_feature_mask & PP_STUTTER_MODE ? false : true;
 
 	return 0;
 fail:
@@ -1469,12 +2027,13 @@ fail:
 	kfree(aconnector);
 	for (i = 0; i < dm->dc->caps.max_planes; i++)
 		kfree(mode_info->planes[i]);
-	return -1;
+	return -EINVAL;
 }
 
 static void amdgpu_dm_destroy_drm_device(struct amdgpu_display_manager *dm)
 {
 	drm_mode_config_cleanup(dm->ddev);
+	drm_atomic_private_obj_fini(&dm->atomic_obj);
 	return;
 }
 
@@ -1482,7 +2041,7 @@ static void amdgpu_dm_destroy_drm_device(struct amdgpu_display_manager *dm)
  * amdgpu_display_funcs functions
  *****************************************************************************/
 
-/**
+/*
  * dm_bandwidth_update - program display watermarks
  *
  * @adev: amdgpu_device pointer
@@ -1494,51 +2053,11 @@ static void dm_bandwidth_update(struct amdgpu_device *adev)
 	/* TODO: implement later */
 }
 
-static void dm_set_backlight_level(struct amdgpu_encoder *amdgpu_encoder,
-				     u8 level)
-{
-	/* TODO: translate amdgpu_encoder to display_index and call DAL */
-}
-
-static u8 dm_get_backlight_level(struct amdgpu_encoder *amdgpu_encoder)
-{
-	/* TODO: translate amdgpu_encoder to display_index and call DAL */
-	return 0;
-}
-
-static int amdgpu_notify_freesync(struct drm_device *dev, void *data,
-				struct drm_file *filp)
-{
-	struct mod_freesync_params freesync_params;
-	uint8_t num_streams;
-	uint8_t i;
-
-	struct amdgpu_device *adev = dev->dev_private;
-	int r = 0;
-
-	/* Get freesync enable flag from DRM */
-
-	num_streams = dc_get_current_stream_count(adev->dm.dc);
-
-	for (i = 0; i < num_streams; i++) {
-		struct dc_stream_state *stream;
-		stream = dc_get_stream_at_index(adev->dm.dc, i);
-
-		mod_freesync_update_state(adev->dm.freesync_module,
-					  &stream, 1, &freesync_params);
-	}
-
-	return r;
-}
-
 static const struct amdgpu_display_funcs dm_display_funcs = {
 	.bandwidth_update = dm_bandwidth_update, /* called unconditionally */
 	.vblank_get_counter = dm_vblank_get_counter,/* called unconditionally */
-	.vblank_wait = NULL,
-	.backlight_set_level =
-		dm_set_backlight_level,/* called unconditionally */
-	.backlight_get_level =
-		dm_get_backlight_level,/* called unconditionally */
+	.backlight_set_level = NULL, /* never called for DC */
+	.backlight_get_level = NULL, /* never called for DC */
 	.hpd_sense = NULL,/* called unconditionally */
 	.hpd_set_polarity = NULL, /* called unconditionally */
 	.hpd_get_gpio_reg = NULL, /* VBIOS parsing. DAL does it. */
@@ -1546,8 +2065,6 @@ static const struct amdgpu_display_funcs dm_display_funcs = {
 		dm_crtc_get_scanoutpos,/* called unconditionally */
 	.add_encoder = NULL, /* VBIOS parsing. DAL does it. */
 	.add_connector = NULL, /* VBIOS parsing. DAL does it. */
-	.notify_freesync = amdgpu_notify_freesync,
-
 };
 
 #if defined(CONFIG_DEBUG_KERNEL_DC)
@@ -1568,7 +2085,6 @@ static ssize_t s3_debug_store(struct device *device,
 	if (ret == 0) {
 		if (s3_state) {
 			dm_resume(adev);
-			amdgpu_dm_display_resume(adev);
 			drm_kms_helper_hotplug_event(adev->ddev);
 		} else
 			dm_suspend(adev);
@@ -1584,9 +2100,6 @@ DEVICE_ATTR_WO(s3_debug);
 static int dm_early_init(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	adev->ddev->driver->driver_features |= DRIVER_ATOMIC;
-	amdgpu_dm_set_irq_funcs(adev);
 
 	switch (adev->asic_type) {
 	case CHIP_BONAIRE:
@@ -1636,12 +2149,15 @@ static int dm_early_init(void *handle)
 		adev->mode_info.plane_type = dm_plane_type_default;
 		break;
 	case CHIP_POLARIS10:
+	case CHIP_VEGAM:
 		adev->mode_info.num_crtc = 6;
 		adev->mode_info.num_hpd = 6;
 		adev->mode_info.num_dig = 6;
 		adev->mode_info.plane_type = dm_plane_type_default;
 		break;
 	case CHIP_VEGA10:
+	case CHIP_VEGA12:
+	case CHIP_VEGA20:
 		adev->mode_info.num_crtc = 6;
 		adev->mode_info.num_hpd = 6;
 		adev->mode_info.num_dig = 6;
@@ -1656,16 +2172,20 @@ static int dm_early_init(void *handle)
 		break;
 #endif
 	default:
-		DRM_ERROR("Usupported ASIC type: 0x%X\n", adev->asic_type);
+		DRM_ERROR("Unsupported ASIC type: 0x%X\n", adev->asic_type);
 		return -EINVAL;
 	}
+
+	amdgpu_dm_set_irq_funcs(adev);
 
 	if (adev->mode_info.funcs == NULL)
 		adev->mode_info.funcs = &dm_display_funcs;
 
-	/* Note: Do NOT change adev->audio_endpt_rreg and
+	/*
+	 * Note: Do NOT change adev->audio_endpt_rreg and
 	 * adev->audio_endpt_wreg because they are initialised in
-	 * amdgpu_device_init() */
+	 * amdgpu_device_init()
+	 */
 #if defined(CONFIG_DEBUG_KERNEL_DC)
 	device_create_file(
 		adev->ddev->dev,
@@ -1674,18 +2194,6 @@ static int dm_early_init(void *handle)
 
 	return 0;
 }
-
-struct dm_connector_state {
-	struct drm_connector_state base;
-
-	enum amdgpu_rmx_type scaling;
-	uint8_t underscan_vborder;
-	uint8_t underscan_hborder;
-	bool underscan_enable;
-};
-
-#define to_dm_connector_state(x)\
-	container_of((x), struct dm_connector_state, base)
 
 static bool modeset_required(struct drm_crtc_state *crtc_state,
 			     struct dc_stream_state *new_stream,
@@ -1723,7 +2231,7 @@ static bool fill_rects_from_plane_state(const struct drm_plane_state *state,
 {
 	plane_state->src_rect.x = state->src_x >> 16;
 	plane_state->src_rect.y = state->src_y >> 16;
-	/*we ignore for now mantissa and do not to deal with floating pixels :(*/
+	/* we ignore the mantissa for now and do not deal with floating pixels :( */
 	plane_state->src_rect.width = state->src_w >> 16;
 
 	if (plane_state->src_rect.width == 0)
@@ -1769,21 +2277,17 @@ static bool fill_rects_from_plane_state(const struct drm_plane_state *state,
 	return true;
 }
 static int get_fb_info(const struct amdgpu_framebuffer *amdgpu_fb,
-		       uint64_t *tiling_flags,
-		       uint64_t *fb_location)
+		       uint64_t *tiling_flags)
 {
-	struct amdgpu_bo *rbo = gem_to_amdgpu_bo(amdgpu_fb->obj);
+	struct amdgpu_bo *rbo = gem_to_amdgpu_bo(amdgpu_fb->base.obj[0]);
 	int r = amdgpu_bo_reserve(rbo, false);
 
 	if (unlikely(r)) {
-		// Don't show error msg. when return -ERESTARTSYS
+		/* Don't show error message when returning -ERESTARTSYS */
 		if (r != -ERESTARTSYS)
 			DRM_ERROR("Unable to reserve buffer: %d\n", r);
 		return r;
 	}
-
-	if (fb_location)
-		*fb_location = amdgpu_bo_gpu_offset(rbo);
 
 	if (tiling_flags)
 		amdgpu_bo_get_tiling_flags(rbo, tiling_flags);
@@ -1795,12 +2299,9 @@ static int get_fb_info(const struct amdgpu_framebuffer *amdgpu_fb,
 
 static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 					 struct dc_plane_state *plane_state,
-					 const struct amdgpu_framebuffer *amdgpu_fb,
-					 bool addReq)
+					 const struct amdgpu_framebuffer *amdgpu_fb)
 {
 	uint64_t tiling_flags;
-	uint64_t fb_location = 0;
-	uint64_t chroma_addr = 0;
 	unsigned int awidth;
 	const struct drm_framebuffer *fb = &amdgpu_fb->base;
 	int ret = 0;
@@ -1808,8 +2309,7 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 
 	ret = get_fb_info(
 		amdgpu_fb,
-		&tiling_flags,
-		addReq == true ? &fb_location:NULL);
+		&tiling_flags);
 
 	if (ret)
 		return ret;
@@ -1833,6 +2333,10 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 	case DRM_FORMAT_ABGR2101010:
 		plane_state->format = SURFACE_PIXEL_FORMAT_GRPH_ABGR2101010;
 		break;
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		plane_state->format = SURFACE_PIXEL_FORMAT_GRPH_ABGR8888;
+		break;
 	case DRM_FORMAT_NV21:
 		plane_state->format = SURFACE_PIXEL_FORMAT_VIDEO_420_YCbCr;
 		break;
@@ -1847,8 +2351,6 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 
 	if (plane_state->format < SURFACE_PIXEL_FORMAT_VIDEO_BEGIN) {
 		plane_state->address.type = PLN_ADDR_TYPE_GRAPHICS;
-		plane_state->address.grph.addr.low_part = lower_32_bits(fb_location);
-		plane_state->address.grph.addr.high_part = upper_32_bits(fb_location);
 		plane_state->plane_size.grph.surface_size.x = 0;
 		plane_state->plane_size.grph.surface_size.y = 0;
 		plane_state->plane_size.grph.surface_size.width = fb->width;
@@ -1861,15 +2363,6 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 	} else {
 		awidth = ALIGN(fb->width, 64);
 		plane_state->address.type = PLN_ADDR_TYPE_VIDEO_PROGRESSIVE;
-		plane_state->address.video_progressive.luma_addr.low_part
-						= lower_32_bits(fb_location);
-		plane_state->address.video_progressive.luma_addr.high_part
-						= upper_32_bits(fb_location);
-		chroma_addr = fb_location + (u64)(awidth * fb->height);
-		plane_state->address.video_progressive.chroma_addr.low_part
-						= lower_32_bits(chroma_addr);
-		plane_state->address.video_progressive.chroma_addr.high_part
-						= upper_32_bits(chroma_addr);
 		plane_state->plane_size.video.luma_size.x = 0;
 		plane_state->plane_size.video.luma_size.y = 0;
 		plane_state->plane_size.video.luma_size.width = awidth;
@@ -1918,6 +2411,8 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 			AMDGPU_TILING_GET(tiling_flags, PIPE_CONFIG);
 
 	if (adev->asic_type == CHIP_VEGA10 ||
+	    adev->asic_type == CHIP_VEGA12 ||
+	    adev->asic_type == CHIP_VEGA20 ||
 	    adev->asic_type == CHIP_RAVEN) {
 		/* Fill GFX9 params */
 		plane_state->tiling_info.gfx9.num_pipes =
@@ -1950,42 +2445,14 @@ static int fill_plane_attributes_from_fb(struct amdgpu_device *adev,
 
 }
 
-static void fill_gamma_from_crtc_state(const struct drm_crtc_state *crtc_state,
-				       struct dc_plane_state *plane_state)
-{
-	int i;
-	struct dc_gamma *gamma;
-	struct drm_color_lut *lut =
-			(struct drm_color_lut *) crtc_state->gamma_lut->data;
-
-	gamma = dc_create_gamma();
-
-	if (gamma == NULL) {
-		WARN_ON(1);
-		return;
-	}
-
-	gamma->type = GAMMA_RGB_256;
-	gamma->num_entries = GAMMA_RGB_256_ENTRIES;
-	for (i = 0; i < GAMMA_RGB_256_ENTRIES; i++) {
-		gamma->entries.red[i] = dal_fixed31_32_from_int(lut[i].red);
-		gamma->entries.green[i] = dal_fixed31_32_from_int(lut[i].green);
-		gamma->entries.blue[i] = dal_fixed31_32_from_int(lut[i].blue);
-	}
-
-	plane_state->gamma_correction = gamma;
-}
-
 static int fill_plane_attributes(struct amdgpu_device *adev,
 				 struct dc_plane_state *dc_plane_state,
 				 struct drm_plane_state *plane_state,
-				 struct drm_crtc_state *crtc_state,
-				 bool addrReq)
+				 struct drm_crtc_state *crtc_state)
 {
 	const struct amdgpu_framebuffer *amdgpu_fb =
 		to_amdgpu_framebuffer(plane_state->fb);
 	const struct drm_crtc *crtc = plane_state->crtc;
-	struct dc_transfer_func *input_tf;
 	int ret = 0;
 
 	if (!fill_rects_from_plane_state(plane_state, dc_plane_state))
@@ -1994,30 +2461,23 @@ static int fill_plane_attributes(struct amdgpu_device *adev,
 	ret = fill_plane_attributes_from_fb(
 		crtc->dev->dev_private,
 		dc_plane_state,
-		amdgpu_fb,
-		addrReq);
+		amdgpu_fb);
 
 	if (ret)
 		return ret;
 
-	input_tf = dc_create_transfer_func();
-
-	if (input_tf == NULL)
-		return -ENOMEM;
-
-	input_tf->type = TF_TYPE_PREDEFINED;
-	input_tf->tf = TRANSFER_FUNCTION_SRGB;
-
-	dc_plane_state->in_transfer_func = input_tf;
-
-	/* In case of gamma set, update gamma value */
-	if (crtc_state->gamma_lut)
-		fill_gamma_from_crtc_state(crtc_state, dc_plane_state);
+	/*
+	 * Always set input transfer function, since plane state is refreshed
+	 * every time.
+	 */
+	ret = amdgpu_dm_set_degamma_lut(crtc_state, dc_plane_state);
+	if (ret) {
+		dc_transfer_func_release(dc_plane_state->in_transfer_func);
+		dc_plane_state->in_transfer_func = NULL;
+	}
 
 	return ret;
 }
-
-/*****************************************************************************/
 
 static void update_stream_scaling_settings(const struct drm_display_mode *mode,
 					   const struct dm_connector_state *dm_state,
@@ -2038,30 +2498,32 @@ static void update_stream_scaling_settings(const struct drm_display_mode *mode,
 	dst.width = stream->timing.h_addressable;
 	dst.height = stream->timing.v_addressable;
 
-	rmx_type = dm_state->scaling;
-	if (rmx_type == RMX_ASPECT || rmx_type == RMX_OFF) {
-		if (src.width * dst.height <
-				src.height * dst.width) {
-			/* height needs less upscaling/more downscaling */
-			dst.width = src.width *
-					dst.height / src.height;
-		} else {
-			/* width needs less upscaling/more downscaling */
-			dst.height = src.height *
-					dst.width / src.width;
+	if (dm_state) {
+		rmx_type = dm_state->scaling;
+		if (rmx_type == RMX_ASPECT || rmx_type == RMX_OFF) {
+			if (src.width * dst.height <
+					src.height * dst.width) {
+				/* height needs less upscaling/more downscaling */
+				dst.width = src.width *
+						dst.height / src.height;
+			} else {
+				/* width needs less upscaling/more downscaling */
+				dst.height = src.height *
+						dst.width / src.width;
+			}
+		} else if (rmx_type == RMX_CENTER) {
+			dst = src;
 		}
-	} else if (rmx_type == RMX_CENTER) {
-		dst = src;
-	}
 
-	dst.x = (stream->timing.h_addressable - dst.width) / 2;
-	dst.y = (stream->timing.v_addressable - dst.height) / 2;
+		dst.x = (stream->timing.h_addressable - dst.width) / 2;
+		dst.y = (stream->timing.v_addressable - dst.height) / 2;
 
-	if (dm_state->underscan_enable) {
-		dst.x += dm_state->underscan_hborder / 2;
-		dst.y += dm_state->underscan_vborder / 2;
-		dst.width -= dm_state->underscan_hborder;
-		dst.height -= dm_state->underscan_vborder;
+		if (dm_state->underscan_enable) {
+			dst.x += dm_state->underscan_hborder / 2;
+			dst.y += dm_state->underscan_vborder / 2;
+			dst.width -= dm_state->underscan_hborder;
+			dst.height -= dm_state->underscan_vborder;
+		}
 	}
 
 	stream->src = src;
@@ -2075,17 +2537,19 @@ static void update_stream_scaling_settings(const struct drm_display_mode *mode,
 static enum dc_color_depth
 convert_color_depth_from_display_info(const struct drm_connector *connector)
 {
+	struct dm_connector_state *dm_conn_state =
+		to_dm_connector_state(connector->state);
 	uint32_t bpc = connector->display_info.bpc;
 
-	/* Limited color depth to 8bit
-	 * TODO: Still need to handle deep color
-	 */
-	if (bpc > 8)
-		bpc = 8;
+	/* TODO: Remove this when there's support for max_bpc in drm */
+	if (dm_conn_state && bpc > dm_conn_state->max_bpc)
+		/* Round down to nearest even number. */
+		bpc = dm_conn_state->max_bpc - (dm_conn_state->max_bpc & 1);
 
 	switch (bpc) {
 	case 0:
-		/* Temporary Work around, DRM don't parse color depth for
+		/*
+		 * Temporary Work around, DRM doesn't parse color depth for
 		 * EDID revision before 1.4
 		 * TODO: Fix edid parsing
 		 */
@@ -2110,13 +2574,8 @@ convert_color_depth_from_display_info(const struct drm_connector *connector)
 static enum dc_aspect_ratio
 get_aspect_ratio(const struct drm_display_mode *mode_in)
 {
-	int32_t width = mode_in->crtc_hdisplay * 9;
-	int32_t height = mode_in->crtc_vdisplay * 16;
-
-	if ((width - height) < 10 && (width - height) > -10)
-		return ASPECT_RATIO_16_9;
-	else
-		return ASPECT_RATIO_4_3;
+	/* 1-1 mapping, since both enums follow the HDMI spec. */
+	return (enum dc_aspect_ratio) mode_in->picture_aspect_ratio;
 }
 
 static enum dc_color_space
@@ -2162,14 +2621,55 @@ get_output_color_space(const struct dc_crtc_timing *dc_crtc_timing)
 	return color_space;
 }
 
-/*****************************************************************************/
+static void reduce_mode_colour_depth(struct dc_crtc_timing *timing_out)
+{
+	if (timing_out->display_color_depth <= COLOR_DEPTH_888)
+		return;
+
+	timing_out->display_color_depth--;
+}
+
+static void adjust_colour_depth_from_display_info(struct dc_crtc_timing *timing_out,
+						const struct drm_display_info *info)
+{
+	int normalized_clk;
+	if (timing_out->display_color_depth <= COLOR_DEPTH_888)
+		return;
+	do {
+		normalized_clk = timing_out->pix_clk_khz;
+		/* YCbCr 4:2:0 requires additional adjustment of 1/2 */
+		if (timing_out->pixel_encoding == PIXEL_ENCODING_YCBCR420)
+			normalized_clk /= 2;
+		/* Adjusting pix clock following on HDMI spec based on colour depth */
+		switch (timing_out->display_color_depth) {
+		case COLOR_DEPTH_101010:
+			normalized_clk = (normalized_clk * 30) / 24;
+			break;
+		case COLOR_DEPTH_121212:
+			normalized_clk = (normalized_clk * 36) / 24;
+			break;
+		case COLOR_DEPTH_161616:
+			normalized_clk = (normalized_clk * 48) / 24;
+			break;
+		default:
+			return;
+		}
+		if (normalized_clk <= info->max_tmds_clock)
+			return;
+		reduce_mode_colour_depth(timing_out);
+
+	} while (timing_out->display_color_depth > COLOR_DEPTH_888);
+
+}
 
 static void
 fill_stream_properties_from_drm_display_mode(struct dc_stream_state *stream,
 					     const struct drm_display_mode *mode_in,
-					     const struct drm_connector *connector)
+					     const struct drm_connector *connector,
+					     const struct dc_stream_state *old_stream)
 {
 	struct dc_crtc_timing *timing_out = &stream->timing;
+	const struct drm_display_info *info = &connector->display_info;
 
 	memset(timing_out, 0, sizeof(struct dc_crtc_timing));
 
@@ -2178,8 +2678,10 @@ fill_stream_properties_from_drm_display_mode(struct dc_stream_state *stream,
 	timing_out->v_border_top = 0;
 	timing_out->v_border_bottom = 0;
 	/* TODO: un-hardcode */
-
-	if ((connector->display_info.color_formats & DRM_COLOR_FORMAT_YCRCB444)
+	if (drm_mode_is_420_only(info, mode_in)
+			&& stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
+		timing_out->pixel_encoding = PIXEL_ENCODING_YCBCR420;
+	else if ((connector->display_info.color_formats & DRM_COLOR_FORMAT_YCRCB444)
 			&& stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
 		timing_out->pixel_encoding = PIXEL_ENCODING_YCBCR444;
 	else
@@ -2190,7 +2692,18 @@ fill_stream_properties_from_drm_display_mode(struct dc_stream_state *stream,
 			connector);
 	timing_out->scan_type = SCANNING_TYPE_NODATA;
 	timing_out->hdmi_vic = 0;
-	timing_out->vic = drm_match_cea_mode(mode_in);
+
+	if(old_stream) {
+		timing_out->vic = old_stream->timing.vic;
+		timing_out->flags.HSYNC_POSITIVE_POLARITY = old_stream->timing.flags.HSYNC_POSITIVE_POLARITY;
+		timing_out->flags.VSYNC_POSITIVE_POLARITY = old_stream->timing.flags.VSYNC_POSITIVE_POLARITY;
+	} else {
+		timing_out->vic = drm_match_cea_mode(mode_in);
+		if (mode_in->flags & DRM_MODE_FLAG_PHSYNC)
+			timing_out->flags.HSYNC_POSITIVE_POLARITY = 1;
+		if (mode_in->flags & DRM_MODE_FLAG_PVSYNC)
+			timing_out->flags.VSYNC_POSITIVE_POLARITY = 1;
+	}
 
 	timing_out->h_addressable = mode_in->crtc_hdisplay;
 	timing_out->h_total = mode_in->crtc_htotal;
@@ -2206,20 +2719,13 @@ fill_stream_properties_from_drm_display_mode(struct dc_stream_state *stream,
 		mode_in->crtc_vsync_end - mode_in->crtc_vsync_start;
 	timing_out->pix_clk_khz = mode_in->crtc_clock;
 	timing_out->aspect_ratio = get_aspect_ratio(mode_in);
-	if (mode_in->flags & DRM_MODE_FLAG_PHSYNC)
-		timing_out->flags.HSYNC_POSITIVE_POLARITY = 1;
-	if (mode_in->flags & DRM_MODE_FLAG_PVSYNC)
-		timing_out->flags.VSYNC_POSITIVE_POLARITY = 1;
 
 	stream->output_color_space = get_output_color_space(timing_out);
 
-	{
-		struct dc_transfer_func *tf = dc_create_transfer_func();
-
-		tf->type = TF_TYPE_PREDEFINED;
-		tf->tf = TRANSFER_FUNCTION_SRGB;
-		stream->out_transfer_func = tf;
-	}
+	stream->out_transfer_func->type = TF_TYPE_PREDEFINED;
+	stream->out_transfer_func->tf = TRANSFER_FUNCTION_SRGB;
+	if (stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A)
+		adjust_colour_depth_from_display_info(timing_out, info);
 }
 
 static void fill_audio_info(struct audio_info *audio_info,
@@ -2235,9 +2741,9 @@ static void fill_audio_info(struct audio_info *audio_info,
 
 	cea_revision = drm_connector->display_info.cea_rev;
 
-	strncpy(audio_info->display_name,
+	strscpy(audio_info->display_name,
 		edid_caps->display_name,
-		AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS - 1);
+		AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS);
 
 	if (cea_revision >= 3) {
 		audio_info->mode_count = edid_caps->audio_mode_count;
@@ -2303,69 +2809,113 @@ decide_crtc_timing_for_drm_display_mode(struct drm_display_mode *drm_mode,
 	}
 }
 
-static int create_fake_sink(struct amdgpu_dm_connector *aconnector)
+static struct dc_sink *
+create_fake_sink(struct amdgpu_dm_connector *aconnector)
 {
-	struct dc_sink *sink = NULL;
 	struct dc_sink_init_data sink_init_data = { 0 };
-
+	struct dc_sink *sink = NULL;
 	sink_init_data.link = aconnector->dc_link;
 	sink_init_data.sink_signal = aconnector->dc_link->connector_signal;
 
 	sink = dc_sink_create(&sink_init_data);
 	if (!sink) {
 		DRM_ERROR("Failed to create sink!\n");
-		return -ENOMEM;
+		return NULL;
 	}
-
 	sink->sink_signal = SIGNAL_TYPE_VIRTUAL;
-	aconnector->fake_enable = true;
 
-	aconnector->dc_sink = sink;
-	aconnector->dc_link->local_sink = sink;
+	return sink;
+}
 
-	return 0;
+static void set_multisync_trigger_params(
+		struct dc_stream_state *stream)
+{
+	if (stream->triggered_crtc_reset.enabled) {
+		stream->triggered_crtc_reset.event = CRTC_EVENT_VSYNC_RISING;
+		stream->triggered_crtc_reset.delay = TRIGGER_DELAY_NEXT_LINE;
+	}
+}
+
+static void set_master_stream(struct dc_stream_state *stream_set[],
+			      int stream_count)
+{
+	int j, highest_rfr = 0, master_stream = 0;
+
+	for (j = 0;  j < stream_count; j++) {
+		if (stream_set[j] && stream_set[j]->triggered_crtc_reset.enabled) {
+			int refresh_rate = 0;
+
+			refresh_rate = (stream_set[j]->timing.pix_clk_khz*1000)/
+				(stream_set[j]->timing.h_total*stream_set[j]->timing.v_total);
+			if (refresh_rate > highest_rfr) {
+				highest_rfr = refresh_rate;
+				master_stream = j;
+			}
+		}
+	}
+	for (j = 0;  j < stream_count; j++) {
+		if (stream_set[j])
+			stream_set[j]->triggered_crtc_reset.event_source = stream_set[master_stream];
+	}
+}
+
+static void dm_enable_per_frame_crtc_master_sync(struct dc_state *context)
+{
+	int i = 0;
+
+	if (context->stream_count < 2)
+		return;
+	for (i = 0; i < context->stream_count ; i++) {
+		if (!context->streams[i])
+			continue;
+		/*
+		 * TODO: add a function to read AMD VSDB bits and set
+		 * crtc_sync_master.multi_sync_enabled flag
+		 * For now it's set to false
+		 */
+		set_multisync_trigger_params(context->streams[i]);
+	}
+	set_master_stream(context->streams, context->stream_count);
 }
 
 static struct dc_stream_state *
 create_stream_for_sink(struct amdgpu_dm_connector *aconnector,
 		       const struct drm_display_mode *drm_mode,
-		       const struct dm_connector_state *dm_state)
+		       const struct dm_connector_state *dm_state,
+		       const struct dc_stream_state *old_stream)
 {
 	struct drm_display_mode *preferred_mode = NULL;
-	const struct drm_connector *drm_connector;
+	struct drm_connector *drm_connector;
 	struct dc_stream_state *stream = NULL;
 	struct drm_display_mode mode = *drm_mode;
 	bool native_mode_found = false;
+	bool scale = dm_state ? (dm_state->scaling != RMX_OFF) : false;
+	int mode_refresh;
+	int preferred_refresh = 0;
 
+	struct dc_sink *sink = NULL;
 	if (aconnector == NULL) {
 		DRM_ERROR("aconnector is NULL!\n");
-		goto drm_connector_null;
-	}
-
-	if (dm_state == NULL) {
-		DRM_ERROR("dm_state is NULL!\n");
-		goto dm_state_null;
+		return stream;
 	}
 
 	drm_connector = &aconnector->base;
 
 	if (!aconnector->dc_sink) {
-		/*
-		 * Exclude MST from creating fake_sink
-		 * TODO: need to enable MST into fake_sink feature
-		 */
-		if (aconnector->mst_port)
-			goto stream_create_fail;
-
-		if (create_fake_sink(aconnector))
-			goto stream_create_fail;
+		if (!aconnector->mst_port) {
+			sink = create_fake_sink(aconnector);
+			if (!sink)
+				return stream;
+		}
+	} else {
+		sink = aconnector->dc_sink;
 	}
 
-	stream = dc_create_stream_for_sink(aconnector->dc_sink);
+	stream = dc_create_stream_for_sink(sink);
 
 	if (stream == NULL) {
 		DRM_ERROR("Failed to create stream for sink!\n");
-		goto stream_create_fail;
+		goto finish;
 	}
 
 	list_for_each_entry(preferred_mode, &aconnector->base.modes, head) {
@@ -2381,8 +2931,11 @@ create_stream_for_sink(struct amdgpu_dm_connector *aconnector,
 				struct drm_display_mode,
 				head);
 
+	mode_refresh = drm_mode_vrefresh(&mode);
+
 	if (preferred_mode == NULL) {
-		/* This may not be an error, the use case is when we we have no
+		/*
+		 * This may not be an error, the use case is when we have no
 		 * usermode calls to reset and set mode upon hotplug. In this
 		 * case, we call set mode ourselves to restore the previous mode
 		 * and the modelist may not be filled in in time.
@@ -2391,21 +2944,40 @@ create_stream_for_sink(struct amdgpu_dm_connector *aconnector,
 	} else {
 		decide_crtc_timing_for_drm_display_mode(
 				&mode, preferred_mode,
-				dm_state->scaling != RMX_OFF);
+				dm_state ? (dm_state->scaling != RMX_OFF) : false);
+		preferred_refresh = drm_mode_vrefresh(preferred_mode);
 	}
 
-	fill_stream_properties_from_drm_display_mode(stream,
-			&mode, &aconnector->base);
+	if (!dm_state)
+		drm_mode_set_crtcinfo(&mode, 0);
+
+	/*
+	* If scaling is enabled and refresh rate didn't change
+	* we copy the vic and polarities of the old timings
+	*/
+	if (!scale || mode_refresh != preferred_refresh)
+		fill_stream_properties_from_drm_display_mode(stream,
+			&mode, &aconnector->base, NULL);
+	else
+		fill_stream_properties_from_drm_display_mode(stream,
+			&mode, &aconnector->base, old_stream);
+
 	update_stream_scaling_settings(&mode, dm_state, stream);
 
 	fill_audio_info(
 		&stream->audio_info,
 		drm_connector,
-		aconnector->dc_sink);
+		sink);
 
-stream_create_fail:
-dm_state_null:
-drm_connector_null:
+	update_stream_signal(stream);
+
+	if (dm_state && dm_state->freesync_capable)
+		stream->ignore_msa_timing_param = true;
+
+finish:
+	if (sink && sink->sink_signal == SIGNAL_TYPE_VIRTUAL && aconnector->base.force != DRM_FORCE_ON)
+		dc_sink_release(sink);
+
 	return stream;
 }
 
@@ -2468,9 +3040,37 @@ dm_crtc_duplicate_state(struct drm_crtc *crtc)
 		dc_stream_retain(state->stream);
 	}
 
+	state->vrr_params = cur->vrr_params;
+	state->vrr_infopacket = cur->vrr_infopacket;
+	state->abm_level = cur->abm_level;
+	state->vrr_supported = cur->vrr_supported;
+	state->freesync_config = cur->freesync_config;
+	state->crc_enabled = cur->crc_enabled;
+
 	/* TODO Duplicate dc_stream after objects are stream object is flattened */
 
 	return &state->base;
+}
+
+
+static inline int dm_set_vblank(struct drm_crtc *crtc, bool enable)
+{
+	enum dc_irq_source irq_source;
+	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+	struct amdgpu_device *adev = crtc->dev->dev_private;
+
+	irq_source = IRQ_TYPE_VBLANK + acrtc->otg_inst;
+	return dc_interrupt_set(adev->dm.dc, irq_source, enable) ? 0 : -EBUSY;
+}
+
+static int dm_enable_vblank(struct drm_crtc *crtc)
+{
+	return dm_set_vblank(crtc, true);
+}
+
+static void dm_disable_vblank(struct drm_crtc *crtc)
+{
+	dm_set_vblank(crtc, false);
 }
 
 /* Implemented only the options currently availible for the driver */
@@ -2482,6 +3082,10 @@ static const struct drm_crtc_funcs amdgpu_dm_crtc_funcs = {
 	.page_flip = drm_atomic_helper_page_flip,
 	.atomic_duplicate_state = dm_crtc_duplicate_state,
 	.atomic_destroy_state = dm_crtc_destroy_state,
+	.set_crc_source = amdgpu_dm_crtc_set_crc_source,
+	.verify_crc_source = amdgpu_dm_crtc_verify_crc_source,
+	.enable_vblank = dm_enable_vblank,
+	.disable_vblank = dm_disable_vblank,
 };
 
 static enum drm_connector_status
@@ -2490,10 +3094,12 @@ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
 	bool connected;
 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
 
-	/* Notes:
+	/*
+	 * Notes:
 	 * 1. This interface is NOT called in context of HPD irq.
 	 * 2. This interface *is called* in context of user-mode ioctl. Which
-	 * makes it a bad place for *any* MST-related activit. */
+	 * makes it a bad place for *any* MST-related activity.
+	 */
 
 	if (aconnector->base.force == DRM_FORCE_UNSPECIFIED &&
 	    !aconnector->fake_enable)
@@ -2552,6 +3158,12 @@ int amdgpu_dm_connector_atomic_set_property(struct drm_connector *connector,
 	} else if (property == adev->mode_info.underscan_property) {
 		dm_new_state->underscan_enable = val;
 		ret = 0;
+	} else if (property == adev->mode_info.max_bpc_property) {
+		dm_new_state->max_bpc = val;
+		ret = 0;
+	} else if (property == adev->mode_info.abm_level_property) {
+		dm_new_state->abm_level = val;
+		ret = 0;
 	}
 
 	return ret;
@@ -2594,7 +3206,14 @@ int amdgpu_dm_connector_atomic_get_property(struct drm_connector *connector,
 	} else if (property == adev->mode_info.underscan_property) {
 		*val = dm_state->underscan_enable;
 		ret = 0;
+	} else if (property == adev->mode_info.max_bpc_property) {
+		*val = dm_state->max_bpc;
+		ret = 0;
+	} else if (property == adev->mode_info.abm_level_property) {
+		*val = dm_state->abm_level;
+		ret = 0;
 	}
+
 	return ret;
 }
 
@@ -2604,19 +3223,18 @@ static void amdgpu_dm_connector_destroy(struct drm_connector *connector)
 	const struct dc_link *link = aconnector->dc_link;
 	struct amdgpu_device *adev = connector->dev->dev_private;
 	struct amdgpu_display_manager *dm = &adev->dm;
+
 #if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) ||\
 	defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
 
-	if (link->connector_signal & (SIGNAL_TYPE_EDP | SIGNAL_TYPE_LVDS)) {
-		amdgpu_dm_register_backlight_device(dm);
-
-		if (dm->backlight_dev) {
-			backlight_device_unregister(dm->backlight_dev);
-			dm->backlight_dev = NULL;
-		}
-
+	if ((link->connector_signal & (SIGNAL_TYPE_EDP | SIGNAL_TYPE_LVDS)) &&
+	    link->type != dc_connection_none &&
+	    dm->backlight_dev) {
+		backlight_device_unregister(dm->backlight_dev);
+		dm->backlight_dev = NULL;
 	}
 #endif
+	drm_dp_cec_unregister_connector(&aconnector->dm_dp_aux.aux);
 	drm_connector_unregister(connector);
 	drm_connector_cleanup(connector);
 	kfree(connector);
@@ -2627,6 +3245,9 @@ void amdgpu_dm_connector_funcs_reset(struct drm_connector *connector)
 	struct dm_connector_state *state =
 		to_dm_connector_state(connector->state);
 
+	if (connector->state)
+		__drm_atomic_helper_connector_destroy_state(connector->state);
+
 	kfree(state);
 
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
@@ -2636,9 +3257,9 @@ void amdgpu_dm_connector_funcs_reset(struct drm_connector *connector)
 		state->underscan_enable = false;
 		state->underscan_hborder = 0;
 		state->underscan_vborder = 0;
+		state->max_bpc = 8;
 
-		connector->state = &state->base;
-		connector->state->connector = connector;
+		__drm_atomic_helper_connector_reset(connector, &state->base);
 	}
 }
 
@@ -2651,13 +3272,20 @@ amdgpu_dm_connector_atomic_duplicate_state(struct drm_connector *connector)
 	struct dm_connector_state *new_state =
 			kmemdup(state, sizeof(*state), GFP_KERNEL);
 
-	if (new_state) {
-		__drm_atomic_helper_connector_duplicate_state(connector,
-							      &new_state->base);
-		return &new_state->base;
-	}
+	if (!new_state)
+		return NULL;
 
-	return NULL;
+	__drm_atomic_helper_connector_duplicate_state(connector, &new_state->base);
+
+	new_state->freesync_capable = state->freesync_capable;
+	new_state->abm_level = state->abm_level;
+	new_state->scaling = state->scaling;
+	new_state->underscan_enable = state->underscan_enable;
+	new_state->underscan_hborder = state->underscan_hborder;
+	new_state->underscan_vborder = state->underscan_vborder;
+	new_state->max_bpc = state->max_bpc;
+
+	return &new_state->base;
 }
 
 static const struct drm_connector_funcs amdgpu_dm_connector_funcs = {
@@ -2671,28 +3299,6 @@ static const struct drm_connector_funcs amdgpu_dm_connector_funcs = {
 	.atomic_get_property = amdgpu_dm_connector_atomic_get_property
 };
 
-static struct drm_encoder *best_encoder(struct drm_connector *connector)
-{
-	int enc_id = connector->encoder_ids[0];
-	struct drm_mode_object *obj;
-	struct drm_encoder *encoder;
-
-	DRM_DEBUG_DRIVER("Finding the best encoder\n");
-
-	/* pick the encoder ids */
-	if (enc_id) {
-		obj = drm_mode_object_find(connector->dev, NULL, enc_id, DRM_MODE_OBJECT_ENCODER);
-		if (!obj) {
-			DRM_ERROR("Couldn't find a matching encoder for our connector\n");
-			return NULL;
-		}
-		encoder = obj_to_encoder(obj);
-		return encoder;
-	}
-	DRM_ERROR("No encoder id\n");
-	return NULL;
-}
-
 static int get_modes(struct drm_connector *connector)
 {
 	return amdgpu_dm_connector_get_modes(connector);
@@ -2704,10 +3310,9 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
 			.link = aconnector->dc_link,
 			.sink_signal = SIGNAL_TYPE_VIRTUAL
 	};
-	struct edid *edid = (struct edid *) aconnector->base.edid_blob_ptr->data;
+	struct edid *edid;
 
-	if (!aconnector->base.edid_blob_ptr ||
-		!aconnector->base.edid_blob_ptr->data) {
+	if (!aconnector->base.edid_blob_ptr) {
 		DRM_ERROR("No EDID firmware found on connector: %s ,forcing to OFF!\n",
 				aconnector->base.name);
 
@@ -2715,6 +3320,8 @@ static void create_eml_sink(struct amdgpu_dm_connector *aconnector)
 		aconnector->base.override_edid = false;
 		return;
 	}
+
+	edid = (struct edid *) aconnector->base.edid_blob_ptr->data;
 
 	aconnector->edid = edid;
 
@@ -2734,7 +3341,8 @@ static void handle_edid_mgmt(struct amdgpu_dm_connector *aconnector)
 {
 	struct dc_link *link = (struct dc_link *)aconnector->dc_link;
 
-	/* In case of headless boot with force on for DP managed connector
+	/*
+	 * In case of headless boot with force on for DP managed connector
 	 * Those settings have to be != 0 to get initial modeset
 	 */
 	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
@@ -2747,7 +3355,7 @@ static void handle_edid_mgmt(struct amdgpu_dm_connector *aconnector)
 	create_eml_sink(aconnector);
 }
 
-int amdgpu_dm_connector_mode_valid(struct drm_connector *connector,
+enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connector,
 				   struct drm_display_mode *mode)
 {
 	int result = MODE_ERROR;
@@ -2756,12 +3364,14 @@ int amdgpu_dm_connector_mode_valid(struct drm_connector *connector,
 	/* TODO: Unhardcode stream count */
 	struct dc_stream_state *stream;
 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+	enum dc_status dc_result = DC_OK;
 
 	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) ||
 			(mode->flags & DRM_MODE_FLAG_DBLSCAN))
 		return result;
 
-	/* Only run this the first time mode_valid is called to initilialize
+	/*
+	 * Only run this the first time mode_valid is called to initilialize
 	 * EDID mgmt
 	 */
 	if (aconnector->base.force != DRM_FORCE_UNSPECIFIED &&
@@ -2775,21 +3385,22 @@ int amdgpu_dm_connector_mode_valid(struct drm_connector *connector,
 		goto fail;
 	}
 
-	stream = dc_create_stream_for_sink(dc_sink);
+	stream = create_stream_for_sink(aconnector, mode, NULL, NULL);
 	if (stream == NULL) {
 		DRM_ERROR("Failed to create stream for sink!\n");
 		goto fail;
 	}
 
-	drm_mode_set_crtcinfo(mode, 0);
-	fill_stream_properties_from_drm_display_mode(stream, mode, connector);
+	dc_result = dc_validate_stream(adev->dm.dc, stream);
 
-	stream->src.width = mode->hdisplay;
-	stream->src.height = mode->vdisplay;
-	stream->dst = stream->src;
-
-	if (dc_validate_stream(adev->dm.dc, stream) == DC_OK)
+	if (dc_result == DC_OK)
 		result = MODE_OK;
+	else
+		DRM_DEBUG_KMS("Mode %dx%d (clk %d) failed DC validation with error %d\n",
+			      mode->vdisplay,
+			      mode->hdisplay,
+			      mode->clock,
+			      dc_result);
 
 	dc_stream_release(stream);
 
@@ -2801,14 +3412,13 @@ fail:
 static const struct drm_connector_helper_funcs
 amdgpu_dm_connector_helper_funcs = {
 	/*
-	 * If hotplug a second bigger display in FB Con mode, bigger resolution
+	 * If hotplugging a second bigger display in FB Con mode, bigger resolution
 	 * modes will be filtered by drm_mode_validate_size(), and those modes
-	 * is missing after user start lightdm. So we need to renew modes list.
+	 * are missing after user start lightdm. So we need to renew modes list.
 	 * in get_modes call back, not just return the modes count
 	 */
 	.get_modes = get_modes,
 	.mode_valid = amdgpu_dm_connector_mode_valid,
-	.best_encoder = best_encoder
 };
 
 static void dm_crtc_helper_disable(struct drm_crtc *crtc)
@@ -2829,7 +3439,7 @@ static int dm_crtc_helper_atomic_check(struct drm_crtc *crtc,
 		return ret;
 	}
 
-	/* In some use cases, like reset, no stream  is attached */
+	/* In some use cases, like reset, no stream is attached */
 	if (!dm_crtc_state->stream)
 		return 0;
 
@@ -2878,7 +3488,7 @@ static void dm_drm_plane_reset(struct drm_plane *plane)
 
 	amdgpu_state = kzalloc(sizeof(*amdgpu_state), GFP_KERNEL);
 	WARN_ON(amdgpu_state == NULL);
-	
+
 	if (amdgpu_state) {
 		plane->state = &amdgpu_state->base;
 		plane->state->plane = plane;
@@ -2920,7 +3530,7 @@ void dm_drm_plane_destroy_state(struct drm_plane *plane,
 static const struct drm_plane_funcs dm_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.destroy	= drm_plane_cleanup,
+	.destroy	= drm_primary_helper_destroy,
 	.reset = dm_drm_plane_reset,
 	.atomic_duplicate_state = dm_drm_plane_duplicate_state,
 	.atomic_destroy_state = dm_drm_plane_destroy_state,
@@ -2931,11 +3541,13 @@ static int dm_plane_helper_prepare_fb(struct drm_plane *plane,
 {
 	struct amdgpu_framebuffer *afb;
 	struct drm_gem_object *obj;
+	struct amdgpu_device *adev;
 	struct amdgpu_bo *rbo;
 	uint64_t chroma_addr = 0;
-	int r;
 	struct dm_plane_state *dm_plane_state_new, *dm_plane_state_old;
 	unsigned int awidth;
+	uint32_t domain;
+	int r;
 
 	dm_plane_state_old = to_dm_plane_state(plane->state);
 	dm_plane_state_new = to_dm_plane_state(new_state);
@@ -2946,23 +3558,36 @@ static int dm_plane_helper_prepare_fb(struct drm_plane *plane,
 	}
 
 	afb = to_amdgpu_framebuffer(new_state->fb);
-
-	obj = afb->obj;
+	obj = new_state->fb->obj[0];
 	rbo = gem_to_amdgpu_bo(obj);
+	adev = amdgpu_ttm_adev(rbo->tbo.bdev);
 	r = amdgpu_bo_reserve(rbo, false);
 	if (unlikely(r != 0))
 		return r;
 
-	r = amdgpu_bo_pin(rbo, AMDGPU_GEM_DOMAIN_VRAM, &afb->address);
+	if (plane->type != DRM_PLANE_TYPE_CURSOR)
+		domain = amdgpu_display_supported_domains(adev);
+	else
+		domain = AMDGPU_GEM_DOMAIN_VRAM;
 
-
-	amdgpu_bo_unreserve(rbo);
-
+	r = amdgpu_bo_pin(rbo, domain);
 	if (unlikely(r != 0)) {
 		if (r != -ERESTARTSYS)
 			DRM_ERROR("Failed to pin framebuffer with error %d\n", r);
+		amdgpu_bo_unreserve(rbo);
 		return r;
 	}
+
+	r = amdgpu_ttm_alloc_gart(&rbo->tbo);
+	if (unlikely(r != 0)) {
+		amdgpu_bo_unpin(rbo);
+		amdgpu_bo_unreserve(rbo);
+		DRM_ERROR("%p bind failed\n", rbo);
+		return r;
+	}
+	amdgpu_bo_unreserve(rbo);
+
+	afb->address = amdgpu_bo_gpu_offset(rbo);
 
 	amdgpu_bo_ref(rbo);
 
@@ -2980,7 +3605,7 @@ static int dm_plane_helper_prepare_fb(struct drm_plane *plane,
 							= lower_32_bits(afb->address);
 			plane_state->address.video_progressive.luma_addr.high_part
 							= upper_32_bits(afb->address);
-			chroma_addr = afb->address + (u64)(awidth * new_state->fb->height);
+			chroma_addr = afb->address + (u64)awidth * new_state->fb->height;
 			plane_state->address.video_progressive.chroma_addr.low_part
 							= lower_32_bits(chroma_addr);
 			plane_state->address.video_progressive.chroma_addr.high_part
@@ -2988,17 +3613,6 @@ static int dm_plane_helper_prepare_fb(struct drm_plane *plane,
 		}
 	}
 
-	/* It's a hack for s3 since in 4.9 kernel filter out cursor buffer
-	 * prepare and cleanup in drm_atomic_helper_prepare_planes
-	 * and drm_atomic_helper_cleanup_planes because fb doens't in s3.
-	 * IN 4.10 kernel this code should be removed and amdgpu_device_suspend
-	 * code touching fram buffers should be avoided for DC.
-	 */
-	if (plane->type == DRM_PLANE_TYPE_CURSOR) {
-		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(new_state->crtc);
-
-		acrtc->cursor_bo = obj;
-	}
 	return 0;
 }
 
@@ -3006,14 +3620,12 @@ static void dm_plane_helper_cleanup_fb(struct drm_plane *plane,
 				       struct drm_plane_state *old_state)
 {
 	struct amdgpu_bo *rbo;
-	struct amdgpu_framebuffer *afb;
 	int r;
 
 	if (!old_state->fb)
 		return;
 
-	afb = to_amdgpu_framebuffer(old_state->fb);
-	rbo = gem_to_amdgpu_bo(afb->obj);
+	rbo = gem_to_amdgpu_bo(old_state->fb->obj[0]);
 	r = amdgpu_bo_reserve(rbo, false);
 	if (unlikely(r)) {
 		DRM_ERROR("failed to reserve rbo before unpin\n");
@@ -3035,23 +3647,69 @@ static int dm_plane_atomic_check(struct drm_plane *plane,
 	if (!dm_plane_state->dc_state)
 		return 0;
 
+	if (!fill_rects_from_plane_state(state, dm_plane_state->dc_state))
+		return -EINVAL;
+
 	if (dc_validate_plane(dc, dm_plane_state->dc_state) == DC_OK)
 		return 0;
 
 	return -EINVAL;
 }
 
+static int dm_plane_atomic_async_check(struct drm_plane *plane,
+				       struct drm_plane_state *new_plane_state)
+{
+	struct drm_plane_state *old_plane_state =
+		drm_atomic_get_old_plane_state(new_plane_state->state, plane);
+
+	/* Only support async updates on cursor planes. */
+	if (plane->type != DRM_PLANE_TYPE_CURSOR)
+		return -EINVAL;
+
+	/*
+	 * DRM calls prepare_fb and cleanup_fb on new_plane_state for
+	 * async commits so don't allow fb changes.
+	 */
+	if (old_plane_state->fb != new_plane_state->fb)
+		return -EINVAL;
+
+	return 0;
+}
+
+static void dm_plane_atomic_async_update(struct drm_plane *plane,
+					 struct drm_plane_state *new_state)
+{
+	struct drm_plane_state *old_state =
+		drm_atomic_get_old_plane_state(new_state->state, plane);
+
+	if (plane->state->fb != new_state->fb)
+		drm_atomic_set_fb_for_plane(plane->state, new_state->fb);
+
+	plane->state->src_x = new_state->src_x;
+	plane->state->src_y = new_state->src_y;
+	plane->state->src_w = new_state->src_w;
+	plane->state->src_h = new_state->src_h;
+	plane->state->crtc_x = new_state->crtc_x;
+	plane->state->crtc_y = new_state->crtc_y;
+	plane->state->crtc_w = new_state->crtc_w;
+	plane->state->crtc_h = new_state->crtc_h;
+
+	handle_cursor_update(plane, old_state);
+}
+
 static const struct drm_plane_helper_funcs dm_plane_helper_funcs = {
 	.prepare_fb = dm_plane_helper_prepare_fb,
 	.cleanup_fb = dm_plane_helper_cleanup_fb,
 	.atomic_check = dm_plane_atomic_check,
+	.atomic_async_check = dm_plane_atomic_async_check,
+	.atomic_async_update = dm_plane_atomic_async_update
 };
 
 /*
  * TODO: these are currently initialized to rgb formats only.
  * For future use cases we should either initialize them dynamically based on
  * plane capabilities, or initialize this array to all formats, so internal drm
- * check will succeed, and let DC to implement proper check
+ * check will succeed, and let DC implement proper check
  */
 static const uint32_t rgb_formats[] = {
 	DRM_FORMAT_RGB888,
@@ -3062,6 +3720,8 @@ static const uint32_t rgb_formats[] = {
 	DRM_FORMAT_XBGR2101010,
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_ABGR2101010,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
 };
 
 static const uint32_t yuv_formats[] = {
@@ -3074,51 +3734,49 @@ static const u32 cursor_formats[] = {
 };
 
 static int amdgpu_dm_plane_init(struct amdgpu_display_manager *dm,
-				struct amdgpu_plane *aplane,
+				struct drm_plane *plane,
 				unsigned long possible_crtcs)
 {
 	int res = -EPERM;
 
-	switch (aplane->base.type) {
+	switch (plane->type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		aplane->base.format_default = true;
-
 		res = drm_universal_plane_init(
 				dm->adev->ddev,
-				&aplane->base,
+				plane,
 				possible_crtcs,
 				&dm_plane_funcs,
 				rgb_formats,
 				ARRAY_SIZE(rgb_formats),
-				NULL, aplane->base.type, NULL);
+				NULL, plane->type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
 		res = drm_universal_plane_init(
 				dm->adev->ddev,
-				&aplane->base,
+				plane,
 				possible_crtcs,
 				&dm_plane_funcs,
 				yuv_formats,
 				ARRAY_SIZE(yuv_formats),
-				NULL, aplane->base.type, NULL);
+				NULL, plane->type, NULL);
 		break;
 	case DRM_PLANE_TYPE_CURSOR:
 		res = drm_universal_plane_init(
 				dm->adev->ddev,
-				&aplane->base,
+				plane,
 				possible_crtcs,
 				&dm_plane_funcs,
 				cursor_formats,
 				ARRAY_SIZE(cursor_formats),
-				NULL, aplane->base.type, NULL);
+				NULL, plane->type, NULL);
 		break;
 	}
 
-	drm_plane_helper_add(&aplane->base, &dm_plane_helper_funcs);
+	drm_plane_helper_add(plane, &dm_plane_helper_funcs);
 
 	/* Create (reset) the plane state */
-	if (aplane->base.funcs->reset)
-		aplane->base.funcs->reset(&aplane->base);
+	if (plane->funcs->reset)
+		plane->funcs->reset(plane);
 
 
 	return res;
@@ -3129,7 +3787,7 @@ static int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
 			       uint32_t crtc_index)
 {
 	struct amdgpu_crtc *acrtc = NULL;
-	struct amdgpu_plane *cursor_plane;
+	struct drm_plane *cursor_plane;
 
 	int res = -ENOMEM;
 
@@ -3137,7 +3795,7 @@ static int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
 	if (!cursor_plane)
 		goto fail;
 
-	cursor_plane->base.type = DRM_PLANE_TYPE_CURSOR;
+	cursor_plane->type = DRM_PLANE_TYPE_CURSOR;
 	res = amdgpu_dm_plane_init(dm, cursor_plane, 0);
 
 	acrtc = kzalloc(sizeof(struct amdgpu_crtc), GFP_KERNEL);
@@ -3148,7 +3806,7 @@ static int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
 			dm->ddev,
 			&acrtc->base,
 			plane,
-			&cursor_plane->base,
+			cursor_plane,
 			&amdgpu_dm_crtc_funcs, NULL);
 
 	if (res)
@@ -3165,9 +3823,12 @@ static int amdgpu_dm_crtc_init(struct amdgpu_display_manager *dm,
 
 	acrtc->crtc_id = crtc_index;
 	acrtc->base.enabled = false;
+	acrtc->otg_inst = -1;
 
 	dm->adev->mode_info.crtcs[crtc_index] = acrtc;
-	drm_mode_crtc_set_gamma_size(&acrtc->base, 256);
+	drm_crtc_enable_color_mgmt(&acrtc->base, MAX_COLOR_LUT_ENTRIES,
+				   true, MAX_COLOR_LUT_ENTRIES);
+	drm_mode_crtc_set_gamma_size(&acrtc->base, MAX_COLOR_LEGACY_LUT_ENTRIES);
 
 	return 0;
 
@@ -3185,6 +3846,8 @@ static int to_drm_connector_type(enum signal_type st)
 		return DRM_MODE_CONNECTOR_HDMIA;
 	case SIGNAL_TYPE_EDP:
 		return DRM_MODE_CONNECTOR_eDP;
+	case SIGNAL_TYPE_LVDS:
+		return DRM_MODE_CONNECTOR_LVDS;
 	case SIGNAL_TYPE_RGB:
 		return DRM_MODE_CONNECTOR_VGA;
 	case SIGNAL_TYPE_DISPLAY_PORT:
@@ -3201,14 +3864,17 @@ static int to_drm_connector_type(enum signal_type st)
 	}
 }
 
+static struct drm_encoder *amdgpu_dm_connector_to_encoder(struct drm_connector *connector)
+{
+	return drm_encoder_find(connector->dev, NULL, connector->encoder_ids[0]);
+}
+
 static void amdgpu_dm_get_native_mode(struct drm_connector *connector)
 {
-	const struct drm_connector_helper_funcs *helper =
-		connector->helper_private;
 	struct drm_encoder *encoder;
 	struct amdgpu_encoder *amdgpu_encoder;
 
-	encoder = helper->best_encoder(connector);
+	encoder = amdgpu_dm_connector_to_encoder(connector);
 
 	if (encoder == NULL)
 		return;
@@ -3250,7 +3916,7 @@ amdgpu_dm_create_common_mode(struct drm_encoder *encoder,
 	mode->hdisplay = hdisplay;
 	mode->vdisplay = vdisplay;
 	mode->type &= ~DRM_MODE_TYPE_PREFERRED;
-	strncpy(mode->name, name, DRM_DISPLAY_MODE_LEN);
+	strscpy(mode->name, name, DRM_DISPLAY_MODE_LEN);
 
 	return mode;
 
@@ -3327,8 +3993,6 @@ static void amdgpu_dm_connector_ddc_get_modes(struct drm_connector *connector,
 		amdgpu_dm_connector->num_modes =
 				drm_add_edid_modes(connector, edid);
 
-		drm_edid_to_eld(connector, edid);
-
 		amdgpu_dm_get_native_mode(connector);
 	} else {
 		amdgpu_dm_connector->num_modes = 0;
@@ -3337,17 +4001,22 @@ static void amdgpu_dm_connector_ddc_get_modes(struct drm_connector *connector,
 
 static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 {
-	const struct drm_connector_helper_funcs *helper =
-			connector->helper_private;
 	struct amdgpu_dm_connector *amdgpu_dm_connector =
 			to_amdgpu_dm_connector(connector);
 	struct drm_encoder *encoder;
 	struct edid *edid = amdgpu_dm_connector->edid;
 
-	encoder = helper->best_encoder(connector);
+	encoder = amdgpu_dm_connector_to_encoder(connector);
 
-	amdgpu_dm_connector_ddc_get_modes(connector, edid);
-	amdgpu_dm_connector_add_common_modes(encoder, connector);
+	if (!edid || !drm_edid_is_valid(edid)) {
+		amdgpu_dm_connector->num_modes =
+				drm_add_modes_noedid(connector, 640, 480);
+	} else {
+		amdgpu_dm_connector_ddc_get_modes(connector, edid);
+		amdgpu_dm_connector_add_common_modes(encoder, connector);
+	}
+	amdgpu_dm_fbc_init(connector);
+
 	return amdgpu_dm_connector->num_modes;
 }
 
@@ -3366,18 +4035,22 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
 	aconnector->base.stereo_allowed = false;
 	aconnector->base.dpms = DRM_MODE_DPMS_OFF;
 	aconnector->hpd.hpd = AMDGPU_HPD_NONE; /* not used */
-
 	mutex_init(&aconnector->hpd_lock);
 
-	/* configure support HPD hot plug connector_>polled default value is 0
+	/*
+	 * configure support HPD hot plug connector_>polled default value is 0
 	 * which means HPD hot plug not supported
 	 */
 	switch (connector_type) {
 	case DRM_MODE_CONNECTOR_HDMIA:
 		aconnector->base.polled = DRM_CONNECTOR_POLL_HPD;
+		aconnector->base.ycbcr_420_allowed =
+			link->link_enc->features.hdmi_ycbcr420_supported ? true : false;
 		break;
 	case DRM_MODE_CONNECTOR_DisplayPort:
 		aconnector->base.polled = DRM_CONNECTOR_POLL_HPD;
+		aconnector->base.ycbcr_420_allowed =
+			link->link_enc->features.dp_ycbcr420_supported ? true : false;
 		break;
 	case DRM_MODE_CONNECTOR_DVID:
 		aconnector->base.polled = DRM_CONNECTOR_POLL_HPD;
@@ -3399,7 +4072,21 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
 	drm_object_attach_property(&aconnector->base.base,
 				adev->mode_info.underscan_vborder_property,
 				0);
+	drm_object_attach_property(&aconnector->base.base,
+				adev->mode_info.max_bpc_property,
+				0);
 
+	if (connector_type == DRM_MODE_CONNECTOR_eDP &&
+	    dc_is_dmcu_initialized(adev->dm.dc)) {
+		drm_object_attach_property(&aconnector->base.base,
+				adev->mode_info.abm_level_property, 0);
+	}
+
+	if (connector_type == DRM_MODE_CONNECTOR_HDMIA ||
+	    connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+		drm_connector_attach_vrr_capable_property(
+			&aconnector->base);
+	}
 }
 
 static int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
@@ -3427,9 +4114,9 @@ static int amdgpu_dm_i2c_xfer(struct i2c_adapter *i2c_adap,
 		cmd.payloads[i].data = msgs[i].buf;
 	}
 
-	if (dal_i2caux_submit_i2c_command(
-			ddc_service->ctx->i2caux,
-			ddc_service->ddc_pin,
+	if (dc_submit_i2c(
+			ddc_service->ctx->dc,
+			ddc_service->ddc_pin->hw_info.ddc_channel,
 			&cmd))
 		result = num;
 
@@ -3465,11 +4152,14 @@ create_i2c(struct ddc_service *ddc_service,
 	snprintf(i2c->base.name, sizeof(i2c->base.name), "AMDGPU DM i2c hw bus %d", link_index);
 	i2c_set_adapdata(&i2c->base, i2c);
 	i2c->ddc_service = ddc_service;
+	i2c->ddc_service->ddc_pin->hw_info.ddc_channel = link_index;
 
 	return i2c;
 }
 
-/* Note: this function assumes that dc_link_detect() was called for the
+
+/*
+ * Note: this function assumes that dc_link_detect() was called for the
  * dc_link which will be represented by this aconnector.
  */
 static int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
@@ -3529,36 +4219,21 @@ static int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
 		link,
 		link_index);
 
-	drm_mode_connector_attach_encoder(
+	drm_connector_attach_encoder(
 		&aconnector->base, &aencoder->base);
 
 	drm_connector_register(&aconnector->base);
+#if defined(CONFIG_DEBUG_FS)
+	res = connector_debugfs_init(aconnector);
+	if (res) {
+		DRM_ERROR("Failed to create debugfs for connector");
+		goto out_free;
+	}
+#endif
 
 	if (connector_type == DRM_MODE_CONNECTOR_DisplayPort
 		|| connector_type == DRM_MODE_CONNECTOR_eDP)
 		amdgpu_dm_initialize_dp_connector(dm, aconnector);
-
-#if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) ||\
-	defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
-
-	/* NOTE: this currently will create backlight device even if a panel
-	 * is not connected to the eDP/LVDS connector.
-	 *
-	 * This is less than ideal but we don't have sink information at this
-	 * stage since detection happens after. We can't do detection earlier
-	 * since MST detection needs connectors to be created first.
-	 */
-	if (link->connector_signal & (SIGNAL_TYPE_EDP | SIGNAL_TYPE_LVDS)) {
-		/* Event if registration failed, we should continue with
-		 * DM initialization because not having a backlight control
-		 * is better then a black screen.
-		 */
-		amdgpu_dm_register_backlight_device(dm);
-
-		if (dm->backlight_dev)
-			dm->backlight_link = link;
-	}
-#endif
 
 out_free:
 	if (res) {
@@ -3620,7 +4295,7 @@ static void manage_dm_interrupts(struct amdgpu_device *adev,
 	 * constant is the same as PFLIP
 	 */
 	int irq_type =
-		amdgpu_crtc_idx_to_irq_type(
+		amdgpu_display_crtc_idx_to_irq_type(
 			adev,
 			acrtc->crtc_id);
 
@@ -3663,8 +4338,6 @@ static void remove_stream(struct amdgpu_device *adev,
 			  struct dc_stream_state *stream)
 {
 	/* this is the update mode case */
-	if (adev->dm.freesync_module)
-		mod_freesync_remove_stream(adev->dm.freesync_module, stream);
 
 	acrtc->otg_inst = -1;
 	acrtc->enabled = false;
@@ -3673,7 +4346,7 @@ static void remove_stream(struct amdgpu_device *adev,
 static int get_cursor_position(struct drm_plane *plane, struct drm_crtc *crtc,
 			       struct dc_cursor_position *position)
 {
-	struct amdgpu_crtc *amdgpu_crtc = amdgpu_crtc = to_amdgpu_crtc(crtc);
+	struct amdgpu_crtc *amdgpu_crtc = to_amdgpu_crtc(crtc);
 	int x, y;
 	int xorigin = 0, yorigin = 0;
 
@@ -3718,6 +4391,7 @@ static int get_cursor_position(struct drm_plane *plane, struct drm_crtc *crtc,
 static void handle_cursor_update(struct drm_plane *plane,
 				 struct drm_plane_state *old_plane_state)
 {
+	struct amdgpu_device *adev = plane->dev->dev_private;
 	struct amdgpu_framebuffer *afb = to_amdgpu_framebuffer(plane->state->fb);
 	struct drm_crtc *crtc = afb ? plane->state->crtc : old_plane_state->crtc;
 	struct dm_crtc_state *crtc_state = crtc ? to_dm_crtc_state(crtc->state) : NULL;
@@ -3742,9 +4416,12 @@ static void handle_cursor_update(struct drm_plane *plane,
 
 	if (!position.enable) {
 		/* turn off cursor */
-		if (crtc_state && crtc_state->stream)
+		if (crtc_state && crtc_state->stream) {
+			mutex_lock(&adev->dm.dc_lock);
 			dc_stream_set_cursor_position(crtc_state->stream,
 						      &position);
+			mutex_unlock(&adev->dm.dc_lock);
+		}
 		return;
 	}
 
@@ -3762,6 +4439,7 @@ static void handle_cursor_update(struct drm_plane *plane,
 	attributes.pitch = attributes.width;
 
 	if (crtc_state->stream) {
+		mutex_lock(&adev->dm.dc_lock);
 		if (!dc_stream_set_cursor_attributes(crtc_state->stream,
 							 &attributes))
 			DRM_ERROR("DC failed to set cursor attributes\n");
@@ -3769,6 +4447,7 @@ static void handle_cursor_update(struct drm_plane *plane,
 		if (!dc_stream_set_cursor_position(crtc_state->stream,
 						   &position))
 			DRM_ERROR("DC failed to set cursor position\n");
+		mutex_unlock(&adev->dm.dc_lock);
 	}
 }
 
@@ -3790,6 +4469,102 @@ static void prepare_flip_isr(struct amdgpu_crtc *acrtc)
 						 acrtc->crtc_id);
 }
 
+struct dc_stream_status *dc_state_get_stream_status(
+	struct dc_state *state,
+	struct dc_stream_state *stream)
+{
+	uint8_t i;
+
+	for (i = 0; i < state->stream_count; i++) {
+		if (stream == state->streams[i])
+			return &state->stream_status[i];
+	}
+
+	return NULL;
+}
+
+static void update_freesync_state_on_stream(
+	struct amdgpu_display_manager *dm,
+	struct dm_crtc_state *new_crtc_state,
+	struct dc_stream_state *new_stream,
+	struct dc_plane_state *surface,
+	u32 flip_timestamp_in_us)
+{
+	struct mod_vrr_params vrr_params = new_crtc_state->vrr_params;
+	struct dc_info_packet vrr_infopacket = {0};
+	struct mod_freesync_config config = new_crtc_state->freesync_config;
+
+	if (!new_stream)
+		return;
+
+	/*
+	 * TODO: Determine why min/max totals and vrefresh can be 0 here.
+	 * For now it's sufficient to just guard against these conditions.
+	 */
+
+	if (!new_stream->timing.h_total || !new_stream->timing.v_total)
+		return;
+
+	if (new_crtc_state->vrr_supported &&
+	    config.min_refresh_in_uhz &&
+	    config.max_refresh_in_uhz) {
+		config.state = new_crtc_state->base.vrr_enabled ?
+			VRR_STATE_ACTIVE_VARIABLE :
+			VRR_STATE_INACTIVE;
+	} else {
+		config.state = VRR_STATE_UNSUPPORTED;
+	}
+
+	mod_freesync_build_vrr_params(dm->freesync_module,
+				      new_stream,
+				      &config, &vrr_params);
+
+	if (surface) {
+		mod_freesync_handle_preflip(
+			dm->freesync_module,
+			surface,
+			new_stream,
+			flip_timestamp_in_us,
+			&vrr_params);
+	}
+
+	mod_freesync_build_vrr_infopacket(
+		dm->freesync_module,
+		new_stream,
+		&vrr_params,
+		PACKET_TYPE_VRR,
+		TRANSFER_FUNC_UNKNOWN,
+		&vrr_infopacket);
+
+	new_crtc_state->freesync_timing_changed =
+		(memcmp(&new_crtc_state->vrr_params.adjust,
+			&vrr_params.adjust,
+			sizeof(vrr_params.adjust)) != 0);
+
+	new_crtc_state->freesync_vrr_info_changed =
+		(memcmp(&new_crtc_state->vrr_infopacket,
+			&vrr_infopacket,
+			sizeof(vrr_infopacket)) != 0);
+
+	new_crtc_state->vrr_params = vrr_params;
+	new_crtc_state->vrr_infopacket = vrr_infopacket;
+
+	new_stream->adjust = new_crtc_state->vrr_params.adjust;
+	new_stream->vrr_infopacket = vrr_infopacket;
+
+	if (new_crtc_state->freesync_vrr_info_changed)
+		DRM_DEBUG_KMS("VRR packet update: crtc=%u enabled=%d state=%d",
+			      new_crtc_state->base.crtc->base.id,
+			      (int)new_crtc_state->base.vrr_enabled,
+			      (int)vrr_params.state);
+
+	if (new_crtc_state->freesync_timing_changed)
+		DRM_DEBUG_KMS("VRR timing update: crtc=%u min=%u max=%u\n",
+			      new_crtc_state->base.crtc->base.id,
+				  vrr_params.adjust.v_total_min,
+				  vrr_params.adjust.v_total_max);
+}
+
 /*
  * Executes flip
  *
@@ -3801,24 +4576,29 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
 			      struct dc_state *state)
 {
 	unsigned long flags;
+	uint64_t timestamp_ns;
 	uint32_t target_vblank;
 	int r, vpos, hpos;
 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
 	struct amdgpu_framebuffer *afb = to_amdgpu_framebuffer(fb);
-	struct amdgpu_bo *abo = gem_to_amdgpu_bo(afb->obj);
+	struct amdgpu_bo *abo = gem_to_amdgpu_bo(fb->obj[0]);
 	struct amdgpu_device *adev = crtc->dev->dev_private;
 	bool async_flip = (crtc->state->pageflip_flags & DRM_MODE_PAGE_FLIP_ASYNC) != 0;
 	struct dc_flip_addrs addr = { {0} };
 	/* TODO eliminate or rename surface_update */
 	struct dc_surface_update surface_updates[1] = { {0} };
+	struct dc_stream_update stream_update = {0};
 	struct dm_crtc_state *acrtc_state = to_dm_crtc_state(crtc->state);
+	struct dc_stream_status *stream_status;
+	struct dc_plane_state *surface;
 
 
 	/* Prepare wait for target vblank early - before the fence-waits */
-	target_vblank = target - drm_crtc_vblank_count(crtc) +
+	target_vblank = target - (uint32_t)drm_crtc_vblank_count(crtc) +
 			amdgpu_get_vblank_counter_kms(crtc->dev, acrtc->crtc_id);
 
-	/* TODO This might fail and hence better not used, wait
+	/*
+	 * TODO This might fail and hence better not used, wait
 	 * explicitly on fences instead
 	 * and in general should be called for
 	 * blocking commit to as per framework helpers
@@ -3835,13 +4615,14 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
 
 	amdgpu_bo_unreserve(abo);
 
-	/* Wait until we're out of the vertical blank period before the one
+	/*
+	 * Wait until we're out of the vertical blank period before the one
 	 * targeted by the flip
 	 */
 	while ((acrtc->enabled &&
-		(amdgpu_get_crtc_scanoutpos(adev->ddev, acrtc->crtc_id, 0,
-					&vpos, &hpos, NULL, NULL,
-					&crtc->hwmode)
+		(amdgpu_display_get_crtc_scanoutpos(adev->ddev, acrtc->crtc_id,
+						    0, &vpos, &hpos, NULL,
+						    NULL, &crtc->hwmode)
 		 & (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_IN_VBLANK)) ==
 		(DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_IN_VBLANK) &&
 		(int)(target_vblank -
@@ -3851,8 +4632,6 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
 
 	/* Flip */
 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
-	/* update crtc fb */
-	crtc->primary->fb = fb;
 
 	WARN_ON(acrtc->pflip_status != AMDGPU_FLIP_NONE);
 	WARN_ON(!acrtc_state->stream);
@@ -3861,32 +4640,175 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
 	addr.address.grph.addr.high_part = upper_32_bits(afb->address);
 	addr.flip_immediate = async_flip;
 
+	timestamp_ns = ktime_get_ns();
+	addr.flip_timestamp_in_us = div_u64(timestamp_ns, 1000);
+
 
 	if (acrtc->base.state->event)
 		prepare_flip_isr(acrtc);
 
-	surface_updates->surface = dc_stream_get_status(acrtc_state->stream)->plane_states[0];
+	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+
+	stream_status = dc_stream_get_status(acrtc_state->stream);
+	if (!stream_status) {
+		DRM_ERROR("No stream status for CRTC: id=%d\n",
+			acrtc->crtc_id);
+		return;
+	}
+
+	surface = stream_status->plane_states[0];
+	surface_updates->surface = surface;
+
+	if (!surface) {
+		DRM_ERROR("No surface for CRTC: id=%d\n",
+			acrtc->crtc_id);
+		return;
+	}
 	surface_updates->flip_addr = &addr;
 
+	if (acrtc_state->stream) {
+		update_freesync_state_on_stream(
+			&adev->dm,
+			acrtc_state,
+			acrtc_state->stream,
+			surface,
+			addr.flip_timestamp_in_us);
+
+		if (acrtc_state->freesync_timing_changed)
+			stream_update.adjust =
+				&acrtc_state->stream->adjust;
+
+		if (acrtc_state->freesync_vrr_info_changed)
+			stream_update.vrr_infopacket =
+				&acrtc_state->stream->vrr_infopacket;
+	}
+
+	/* Update surface timing information. */
+	surface->time.time_elapsed_in_us[surface->time.index] =
+		addr.flip_timestamp_in_us - surface->time.prev_update_time_in_us;
+	surface->time.prev_update_time_in_us = addr.flip_timestamp_in_us;
+	surface->time.index++;
+	if (surface->time.index >= DC_PLANE_UPDATE_TIMES_MAX)
+		surface->time.index = 0;
+
+	mutex_lock(&adev->dm.dc_lock);
 
 	dc_commit_updates_for_stream(adev->dm.dc,
 					     surface_updates,
 					     1,
 					     acrtc_state->stream,
-					     NULL,
+					     &stream_update,
 					     &surface_updates->surface,
 					     state);
+	mutex_unlock(&adev->dm.dc_lock);
 
 	DRM_DEBUG_DRIVER("%s Flipping to hi: 0x%x, low: 0x%x \n",
 			 __func__,
 			 addr.address.grph.addr.high_part,
 			 addr.address.grph.addr.low_part);
+}
 
+/*
+ * TODO this whole function needs to go
+ *
+ * dc_surface_update is needlessly complex. See if we can just replace this
+ * with a dc_plane_state and follow the atomic model a bit more closely here.
+ */
+static bool commit_planes_to_stream(
+		struct amdgpu_display_manager *dm,
+		struct dc *dc,
+		struct dc_plane_state **plane_states,
+		uint8_t new_plane_count,
+		struct dm_crtc_state *dm_new_crtc_state,
+		struct dm_crtc_state *dm_old_crtc_state,
+		struct dc_state *state)
+{
+	/* no need to dynamically allocate this. it's pretty small */
+	struct dc_surface_update updates[MAX_SURFACES];
+	struct dc_flip_addrs *flip_addr;
+	struct dc_plane_info *plane_info;
+	struct dc_scaling_info *scaling_info;
+	int i;
+	struct dc_stream_state *dc_stream = dm_new_crtc_state->stream;
+	struct dc_stream_update *stream_update =
+			kzalloc(sizeof(struct dc_stream_update), GFP_KERNEL);
+	unsigned int abm_level;
 
-	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+	if (!stream_update) {
+		BREAK_TO_DEBUGGER();
+		return false;
+	}
+
+	flip_addr = kcalloc(MAX_SURFACES, sizeof(struct dc_flip_addrs),
+			    GFP_KERNEL);
+	plane_info = kcalloc(MAX_SURFACES, sizeof(struct dc_plane_info),
+			     GFP_KERNEL);
+	scaling_info = kcalloc(MAX_SURFACES, sizeof(struct dc_scaling_info),
+			       GFP_KERNEL);
+
+	if (!flip_addr || !plane_info || !scaling_info) {
+		kfree(flip_addr);
+		kfree(plane_info);
+		kfree(scaling_info);
+		kfree(stream_update);
+		return false;
+	}
+
+	memset(updates, 0, sizeof(updates));
+
+	stream_update->src = dc_stream->src;
+	stream_update->dst = dc_stream->dst;
+	stream_update->out_transfer_func = dc_stream->out_transfer_func;
+
+	if (dm_new_crtc_state->abm_level != dm_old_crtc_state->abm_level) {
+		abm_level = dm_new_crtc_state->abm_level;
+		stream_update->abm_level = &abm_level;
+	}
+
+	for (i = 0; i < new_plane_count; i++) {
+		updates[i].surface = plane_states[i];
+		updates[i].gamma =
+			(struct dc_gamma *)plane_states[i]->gamma_correction;
+		updates[i].in_transfer_func = plane_states[i]->in_transfer_func;
+		flip_addr[i].address = plane_states[i]->address;
+		flip_addr[i].flip_immediate = plane_states[i]->flip_immediate;
+		plane_info[i].color_space = plane_states[i]->color_space;
+		plane_info[i].format = plane_states[i]->format;
+		plane_info[i].plane_size = plane_states[i]->plane_size;
+		plane_info[i].rotation = plane_states[i]->rotation;
+		plane_info[i].horizontal_mirror = plane_states[i]->horizontal_mirror;
+		plane_info[i].stereo_format = plane_states[i]->stereo_format;
+		plane_info[i].tiling_info = plane_states[i]->tiling_info;
+		plane_info[i].visible = plane_states[i]->visible;
+		plane_info[i].per_pixel_alpha = plane_states[i]->per_pixel_alpha;
+		plane_info[i].dcc = plane_states[i]->dcc;
+		scaling_info[i].scaling_quality = plane_states[i]->scaling_quality;
+		scaling_info[i].src_rect = plane_states[i]->src_rect;
+		scaling_info[i].dst_rect = plane_states[i]->dst_rect;
+		scaling_info[i].clip_rect = plane_states[i]->clip_rect;
+
+		updates[i].flip_addr = &flip_addr[i];
+		updates[i].plane_info = &plane_info[i];
+		updates[i].scaling_info = &scaling_info[i];
+	}
+
+	mutex_lock(&dm->dc_lock);
+	dc_commit_updates_for_stream(
+			dc,
+			updates,
+			new_plane_count,
+			dc_stream, stream_update, plane_states, state);
+	mutex_unlock(&dm->dc_lock);
+
+	kfree(flip_addr);
+	kfree(plane_info);
+	kfree(scaling_info);
+	kfree(stream_update);
+	return true;
 }
 
 static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+				    struct dc_state *dc_state,
 				    struct drm_device *dev,
 				    struct amdgpu_display_manager *dm,
 				    struct drm_crtc *pcrtc,
@@ -3901,7 +4823,8 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 	struct drm_crtc_state *new_pcrtc_state =
 			drm_atomic_get_new_crtc_state(state, pcrtc);
 	struct dm_crtc_state *acrtc_state = to_dm_crtc_state(new_pcrtc_state);
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
+	struct dm_crtc_state *dm_old_crtc_state =
+			to_dm_crtc_state(drm_atomic_get_old_crtc_state(state, pcrtc));
 	int planes_count = 0;
 	unsigned long flags;
 
@@ -3937,7 +4860,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 		}
 		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 
-		if (!pflip_needed) {
+		if (!pflip_needed || plane->type == DRM_PLANE_TYPE_OVERLAY) {
 			WARN_ON(!dm_new_plane_state->dc_state);
 
 			plane_states_constructed[planes_count] = dm_new_plane_state->dc_state;
@@ -3961,8 +4884,8 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 			amdgpu_dm_do_flip(
 				crtc,
 				fb,
-				drm_crtc_vblank_count(crtc) + *wait_for_vblank,
-				dm_state->context);
+				(uint32_t)drm_crtc_vblank_count(crtc) + *wait_for_vblank,
+				dc_state);
 		}
 
 	}
@@ -3979,17 +4902,34 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 			spin_unlock_irqrestore(&pcrtc->dev->event_lock, flags);
 		}
 
-		if (false == dc_commit_planes_to_stream(dm->dc,
+		dc_stream_attach->abm_level = acrtc_state->abm_level;
+
+		if (false == commit_planes_to_stream(dm,
+							dm->dc,
 							plane_states_constructed,
 							planes_count,
-							dc_stream_attach,
-							dm_state->context))
+							acrtc_state,
+							dm_old_crtc_state,
+							dc_state))
 			dm_error("%s: Failed to attach plane!\n", __func__);
 	} else {
 		/*TODO BUG Here should go disable planes on CRTC. */
 	}
 }
 
+/*
+ * amdgpu_dm_crtc_copy_transient_flags - copy mirrored flags from DRM to DC
+ * @crtc_state: the DRM CRTC state
+ * @stream_state: the DC stream state.
+ *
+ * Copy the mirrored transient state flags from DRM, to DC. It is used to bring
+ * a dc_stream_state's flags in sync with a drm_crtc_state's flags.
+ */
+static void amdgpu_dm_crtc_copy_transient_flags(struct drm_crtc_state *crtc_state,
+						struct dc_stream_state *stream_state)
+{
+	stream_state->mode_changed = crtc_state->mode_changed;
+}
 
 static int amdgpu_dm_atomic_commit(struct drm_device *dev,
 				   struct drm_atomic_state *state,
@@ -4014,35 +4954,53 @@ static int amdgpu_dm_atomic_commit(struct drm_device *dev,
 		if (drm_atomic_crtc_needs_modeset(new_crtc_state) && dm_old_crtc_state->stream)
 			manage_dm_interrupts(adev, acrtc, false);
 	}
-	/* Add check here for SoC's that support hardware cursor plane, to
-	 * unset legacy_cursor_update */
+	/*
+	 * Add check here for SoC's that support hardware cursor plane, to
+	 * unset legacy_cursor_update
+	 */
 
 	return drm_atomic_helper_commit(dev, state, nonblock);
 
 	/*TODO Handle EINTR, reenable IRQ*/
 }
 
+/**
+ * amdgpu_dm_atomic_commit_tail() - AMDgpu DM's commit tail implementation.
+ * @state: The atomic state to commit
+ *
+ * This will tell DC to commit the constructed DC state from atomic_check,
+ * programming the hardware. Any failures here implies a hardware failure, since
+ * atomic check should have filtered anything non-kosher.
+ */
 static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 {
 	struct drm_device *dev = state->dev;
 	struct amdgpu_device *adev = dev->dev_private;
 	struct amdgpu_display_manager *dm = &adev->dm;
 	struct dm_atomic_state *dm_state;
+	struct dc_state *dc_state = NULL, *dc_state_temp = NULL;
 	uint32_t i, j;
-	uint32_t new_crtcs_count = 0;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
-	struct amdgpu_crtc *new_crtcs[MAX_STREAMS];
-	struct dc_stream_state *new_stream = NULL;
 	unsigned long flags;
 	bool wait_for_vblank = true;
 	struct drm_connector *connector;
 	struct drm_connector_state *old_con_state, *new_con_state;
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
+	int crtc_disable_count = 0;
 
 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
 
-	dm_state = to_dm_atomic_state(state);
+	dm_state = dm_atomic_get_new_state(state);
+	if (dm_state && dm_state->context) {
+		dc_state = dm_state->context;
+	} else {
+		/* No state changes, retain current state. */
+		dc_state_temp = dc_create_state();
+		ASSERT(dc_state_temp);
+		dc_state = dc_state_temp;
+		dc_resource_state_copy_construct_current(dm->dc, dc_state);
+	}
 
 	/* update changed items */
 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
@@ -4063,6 +5021,12 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 			new_crtc_state->active_changed,
 			new_crtc_state->connectors_changed);
 
+		/* Copy all transient state flags into dc state */
+		if (dm_new_crtc_state->stream) {
+			amdgpu_dm_crtc_copy_transient_flags(&dm_new_crtc_state->base,
+							    dm_new_crtc_state->stream);
+		}
+
 		/* handles headless hotplug case, updating new_state and
 		 * aconnector as needed
 		 */
@@ -4076,8 +5040,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 				 * this could happen because of issues with
 				 * userspace notifications delivery.
 				 * In this case userspace tries to set mode on
-				 * display which is disconnect in fact.
-				 * dc_sink in NULL in this case on aconnector.
+				 * display which is disconnected in fact.
+				 * dc_sink is NULL in this case on aconnector.
 				 * We expect reset mode will come soon.
 				 *
 				 * This can also happen when unplug is done
@@ -4092,25 +5056,11 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 				continue;
 			}
 
-
 			if (dm_old_crtc_state->stream)
 				remove_stream(adev, acrtc, dm_old_crtc_state->stream);
 
+			pm_runtime_get_noresume(dev->dev);
 
-			/*
-			 * this loop saves set mode crtcs
-			 * we needed to enable vblanks once all
-			 * resources acquired in dc after dc_commit_streams
-			 */
-
-			/*TODO move all this into dm_crtc_state, get rid of
-			 * new_crtcs array and use old and new atomic states
-			 * instead
-			 */
-			new_crtcs[new_crtcs_count] = acrtc;
-			new_crtcs_count++;
-
-			new_crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 			acrtc->enabled = true;
 			acrtc->hw_mode = new_crtc_state->mode;
 			crtc->hwmode = new_crtc_state->mode;
@@ -4123,36 +5073,12 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 		}
 	} /* for_each_crtc_in_state() */
 
-	/*
-	 * Add streams after required streams from new and replaced streams
-	 * are removed from freesync module
-	 */
-	if (adev->dm.freesync_module) {
-		for (i = 0; i < new_crtcs_count; i++) {
-			struct amdgpu_dm_connector *aconnector = NULL;
-
-			new_crtc_state = drm_atomic_get_new_crtc_state(state,
-					&new_crtcs[i]->base);
-			dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
-
-			new_stream = dm_new_crtc_state->stream;
-			aconnector = amdgpu_dm_find_first_crtc_matching_connector(
-					state,
-					&new_crtcs[i]->base);
-			if (!aconnector) {
-				DRM_DEBUG_DRIVER("Atomic commit: Failed to find connector for acrtc id:%d "
-					 "skipping freesync init\n",
-					 new_crtcs[i]->crtc_id);
-				continue;
-			}
-
-			mod_freesync_add_stream(adev->dm.freesync_module,
-						new_stream, &aconnector->caps);
-		}
+	if (dc_state) {
+		dm_enable_per_frame_crtc_master_sync(dc_state);
+		mutex_lock(&dm->dc_lock);
+		WARN_ON(!dc_commit_state(dm->dc, dc_state));
+		mutex_unlock(&dm->dc_lock);
 	}
-
-	if (dm_state->context)
-		WARN_ON(!dc_commit_state(dm->dc, dm_state->context));
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
@@ -4164,64 +5090,85 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 					dc_stream_get_status(dm_new_crtc_state->stream);
 
 			if (!status)
+				status = dc_state_get_stream_status(dc_state,
+								    dm_new_crtc_state->stream);
+
+			if (!status)
 				DC_ERR("got no status for stream %p on acrtc%p\n", dm_new_crtc_state->stream, acrtc);
 			else
 				acrtc->otg_inst = status->primary_otg_inst;
 		}
 	}
 
-	/* Handle scaling and underscan changes*/
+	/* Handle scaling, underscan, and abm changes*/
 	for_each_oldnew_connector_in_state(state, connector, old_con_state, new_con_state, i) {
 		struct dm_connector_state *dm_new_con_state = to_dm_connector_state(new_con_state);
 		struct dm_connector_state *dm_old_con_state = to_dm_connector_state(old_con_state);
 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(dm_new_con_state->base.crtc);
 		struct dc_stream_status *status = NULL;
 
-		if (acrtc)
+		if (acrtc) {
 			new_crtc_state = drm_atomic_get_new_crtc_state(state, &acrtc->base);
+			old_crtc_state = drm_atomic_get_old_crtc_state(state, &acrtc->base);
+		}
 
 		/* Skip any modesets/resets */
 		if (!acrtc || drm_atomic_crtc_needs_modeset(new_crtc_state))
 			continue;
 
-		/* Skip any thing not scale or underscan changes */
-		if (!is_scaling_state_different(dm_new_con_state, dm_old_con_state))
-			continue;
 
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
+
+		/* Skip anything that is not scaling or underscan changes */
+		if (!is_scaling_state_different(dm_new_con_state, dm_old_con_state) &&
+				(dm_new_crtc_state->abm_level == dm_old_crtc_state->abm_level))
+			continue;
 
 		update_stream_scaling_settings(&dm_new_con_state->base.crtc->mode,
 				dm_new_con_state, (struct dc_stream_state *)dm_new_crtc_state->stream);
+
+		if (!dm_new_crtc_state->stream)
+			continue;
 
 		status = dc_stream_get_status(dm_new_crtc_state->stream);
 		WARN_ON(!status);
 		WARN_ON(!status->plane_count);
 
-		if (!dm_new_crtc_state->stream)
-			continue;
+		dm_new_crtc_state->stream->abm_level = dm_new_crtc_state->abm_level;
 
 		/*TODO How it works with MPO ?*/
-		if (!dc_commit_planes_to_stream(
+		if (!commit_planes_to_stream(
+				dm,
 				dm->dc,
 				status->plane_states,
 				status->plane_count,
-				dm_new_crtc_state->stream,
-				dm_state->context))
+				dm_new_crtc_state,
+				to_dm_crtc_state(old_crtc_state),
+				dc_state))
 			dm_error("%s: Failed to update stream scaling!\n", __func__);
 	}
 
-	for (i = 0; i < new_crtcs_count; i++) {
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+			new_crtc_state, i) {
 		/*
 		 * loop to enable interrupts on newly arrived crtc
 		 */
-		struct amdgpu_crtc *acrtc = new_crtcs[i];
+		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+		bool modeset_needed;
 
-		new_crtc_state = drm_atomic_get_new_crtc_state(state, &acrtc->base);
+		if (old_crtc_state->active && !new_crtc_state->active)
+			crtc_disable_count++;
+
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
+		modeset_needed = modeset_required(
+				new_crtc_state,
+				dm_new_crtc_state->stream,
+				dm_old_crtc_state->stream);
 
-		if (adev->dm.freesync_module)
-			mod_freesync_notify_mode_change(
-				adev->dm.freesync_module, &dm_new_crtc_state->stream, 1);
+		if (dm_new_crtc_state->stream == NULL || !modeset_needed)
+			continue;
 
 		manage_dm_interrupts(adev, acrtc, true);
 	}
@@ -4231,7 +5178,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
 
 		if (dm_new_crtc_state->stream)
-			amdgpu_dm_commit_planes(state, dev, dm, crtc, &wait_for_vblank);
+			amdgpu_dm_commit_planes(state, dc_state, dev,
+						dm, crtc, &wait_for_vblank);
 	}
 
 
@@ -4249,13 +5197,31 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	}
 	spin_unlock_irqrestore(&adev->ddev->event_lock, flags);
 
-	/* Signal HW programming completion */
-	drm_atomic_helper_commit_hw_done(state);
 
 	if (wait_for_vblank)
-		drm_atomic_helper_wait_for_vblanks(dev, state);
+		drm_atomic_helper_wait_for_flip_done(dev, state);
+
+	/*
+	 * FIXME:
+	 * Delay hw_done() until flip_done() is signaled. This is to block
+	 * another commit from freeing the CRTC state while we're still
+	 * waiting on flip_done.
+	 */
+	drm_atomic_helper_commit_hw_done(state);
 
 	drm_atomic_helper_cleanup_planes(dev, state);
+
+	/*
+	 * Finally, drop a runtime PM reference for each newly disabled CRTC,
+	 * so we can put the GPU into runtime suspend if we're not driving any
+	 * displays anymore
+	 */
+	for (i = 0; i < crtc_disable_count; i++)
+		pm_runtime_put_autosuspend(dev->dev);
+	pm_runtime_mark_last_busy(dev->dev);
+
+	if (dc_state_temp)
+		dc_release_state(dc_state_temp);
 }
 
 
@@ -4317,9 +5283,9 @@ err:
 }
 
 /*
- * This functions handle all cases when set mode does not come upon hotplug.
- * This include when the same display is unplugged then plugged back into the
- * same port and when we are running without usermode desktop manager supprot
+ * This function handles all cases when set mode does not come upon hotplug.
+ * This includes when a display is unplugged then plugged back into the
+ * same port and when running without usermode desktop manager supprot
  */
 void dm_restore_drm_connector_state(struct drm_device *dev,
 				    struct drm_connector *connector)
@@ -4332,9 +5298,11 @@ void dm_restore_drm_connector_state(struct drm_device *dev,
 		return;
 
 	disconnected_acrtc = to_amdgpu_crtc(connector->encoder->crtc);
-	acrtc_state = to_dm_crtc_state(disconnected_acrtc->base.state);
+	if (!disconnected_acrtc)
+		return;
 
-	if (!disconnected_acrtc || !acrtc_state->stream)
+	acrtc_state = to_dm_crtc_state(disconnected_acrtc->base.state);
+	if (!acrtc_state->stream)
 		return;
 
 	/*
@@ -4346,7 +5314,7 @@ void dm_restore_drm_connector_state(struct drm_device *dev,
 		dm_force_atomic_commit(&aconnector->base);
 }
 
-/*`
+/*
  * Grabs all modesetting locks to serialize against any blocking commits,
  * Waits for completion of all non blocking commits.
  */
@@ -4357,7 +5325,8 @@ static int do_aquire_global_lock(struct drm_device *dev,
 	struct drm_crtc_commit *commit;
 	long ret;
 
-	/* Adding all modeset locks to aquire_ctx will
+	/*
+	 * Adding all modeset locks to aquire_ctx will
 	 * ensure that when the framework release it the
 	 * extra locks we are locking here will get released to
 	 */
@@ -4376,7 +5345,8 @@ static int do_aquire_global_lock(struct drm_device *dev,
 		if (!commit)
 			continue;
 
-		/* Make sure all pending HW programming completed and
+		/*
+		 * Make sure all pending HW programming completed and
 		 * page flips done
 		 */
 		ret = wait_for_completion_interruptible_timeout(&commit->hw_done, 10*HZ);
@@ -4395,26 +5365,65 @@ static int do_aquire_global_lock(struct drm_device *dev,
 	return ret < 0 ? ret : 0;
 }
 
-static int dm_update_crtcs_state(struct dc *dc,
+static void get_freesync_config_for_crtc(
+	struct dm_crtc_state *new_crtc_state,
+	struct dm_connector_state *new_con_state)
+{
+	struct mod_freesync_config config = {0};
+	struct amdgpu_dm_connector *aconnector =
+			to_amdgpu_dm_connector(new_con_state->base.connector);
+
+	new_crtc_state->vrr_supported = new_con_state->freesync_capable;
+
+	if (new_con_state->freesync_capable) {
+		config.state = new_crtc_state->base.vrr_enabled ?
+				VRR_STATE_ACTIVE_VARIABLE :
+				VRR_STATE_INACTIVE;
+		config.min_refresh_in_uhz =
+				aconnector->min_vfreq * 1000000;
+		config.max_refresh_in_uhz =
+				aconnector->max_vfreq * 1000000;
+		config.vsif_supported = true;
+		config.btr = true;
+	}
+
+	new_crtc_state->freesync_config = config;
+}
+
+static void reset_freesync_config_for_crtc(
+	struct dm_crtc_state *new_crtc_state)
+{
+	new_crtc_state->vrr_supported = false;
+
+	memset(&new_crtc_state->vrr_params, 0,
+	       sizeof(new_crtc_state->vrr_params));
+	memset(&new_crtc_state->vrr_infopacket, 0,
+	       sizeof(new_crtc_state->vrr_infopacket));
+}
+
+static int dm_update_crtcs_state(struct amdgpu_display_manager *dm,
 				 struct drm_atomic_state *state,
 				 bool enable,
 				 bool *lock_and_validation_needed)
 {
+	struct dm_atomic_state *dm_state = NULL;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
 	int i;
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
 	struct dc_stream_state *new_stream;
 	int ret = 0;
 
-	/*TODO Move this code into dm_crtc_atomic_check once we get rid of dc_validation_set */
-	/* update changed items */
+	/*
+	 * TODO Move this code into dm_crtc_atomic_check once we get rid of dc_validation_set
+	 * update changed items
+	 */
 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
 		struct amdgpu_crtc *acrtc = NULL;
 		struct amdgpu_dm_connector *aconnector = NULL;
-		struct drm_connector_state *new_con_state = NULL;
-		struct dm_connector_state *dm_conn_state = NULL;
+		struct drm_connector_state *drm_new_conn_state = NULL, *drm_old_conn_state = NULL;
+		struct dm_connector_state *dm_new_conn_state = NULL, *dm_old_conn_state = NULL;
+		struct drm_plane_state *new_plane_state = NULL;
 
 		new_stream = NULL;
 
@@ -4422,30 +5431,41 @@ static int dm_update_crtcs_state(struct dc *dc,
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
 		acrtc = to_amdgpu_crtc(crtc);
 
+		new_plane_state = drm_atomic_get_new_plane_state(state, new_crtc_state->crtc->primary);
+
+		if (new_crtc_state->enable && new_plane_state && !new_plane_state->fb) {
+			ret = -EINVAL;
+			goto fail;
+		}
+
 		aconnector = amdgpu_dm_find_first_crtc_matching_connector(state, crtc);
 
 		/* TODO This hack should go away */
 		if (aconnector && enable) {
-			// Make sure fake sink is created in plug-in scenario
-			new_con_state = drm_atomic_get_connector_state(state,
+			/* Make sure fake sink is created in plug-in scenario */
+			drm_new_conn_state = drm_atomic_get_new_connector_state(state,
  								    &aconnector->base);
+			drm_old_conn_state = drm_atomic_get_old_connector_state(state,
+								    &aconnector->base);
 
-			if (IS_ERR(new_con_state)) {
-				ret = PTR_ERR_OR_ZERO(new_con_state);
+			if (IS_ERR(drm_new_conn_state)) {
+				ret = PTR_ERR_OR_ZERO(drm_new_conn_state);
 				break;
 			}
 
-			dm_conn_state = to_dm_connector_state(new_con_state);
+			dm_new_conn_state = to_dm_connector_state(drm_new_conn_state);
+			dm_old_conn_state = to_dm_connector_state(drm_old_conn_state);
 
 			new_stream = create_stream_for_sink(aconnector,
 							     &new_crtc_state->mode,
-							    dm_conn_state);
+							    dm_new_conn_state,
+							    dm_old_crtc_state->stream);
 
 			/*
 			 * we can have no stream on ACTION_SET if a display
-			 * was disconnected during S3, in this case it not and
+			 * was disconnected during S3, in this case it is not an
 			 * error, the OS will be updated after detection, and
-			 * do the right thing on next atomic commit
+			 * will do the right thing on next atomic commit
 			 */
 
 			if (!new_stream) {
@@ -4453,17 +5473,16 @@ static int dm_update_crtcs_state(struct dc *dc,
 						__func__, acrtc->base.base.id);
 				break;
 			}
+
+			dm_new_crtc_state->abm_level = dm_new_conn_state->abm_level;
+
+			if (dc_is_stream_unchanged(new_stream, dm_old_crtc_state->stream) &&
+			    dc_is_stream_scaling_unchanged(new_stream, dm_old_crtc_state->stream)) {
+				new_crtc_state->mode_changed = false;
+				DRM_DEBUG_DRIVER("Mode change not required, setting mode_changed to %d",
+						 new_crtc_state->mode_changed);
+			}
 		}
-
-		if (dc_is_stream_unchanged(new_stream, dm_old_crtc_state->stream) &&
-				dc_is_stream_scaling_unchanged(new_stream, dm_old_crtc_state->stream)) {
-
-			new_crtc_state->mode_changed = false;
-
-			DRM_DEBUG_DRIVER("Mode change not required, setting mode_changed to %d",
-				         new_crtc_state->mode_changed);
-		}
-
 
 		if (!drm_atomic_crtc_needs_modeset(new_crtc_state))
 			goto next_crtc;
@@ -4486,12 +5505,16 @@ static int dm_update_crtcs_state(struct dc *dc,
 			if (!dm_old_crtc_state->stream)
 				goto next_crtc;
 
+			ret = dm_atomic_get_state(state, &dm_state);
+			if (ret)
+				goto fail;
+
 			DRM_DEBUG_DRIVER("Disabling DRM crtc: %d\n",
 					crtc->base.id);
 
 			/* i.e. reset mode */
 			if (dc_remove_stream_from_ctx(
-					dc,
+					dm->dc,
 					dm_state->context,
 					dm_old_crtc_state->stream) != DC_OK) {
 				ret = -EINVAL;
@@ -4500,6 +5523,8 @@ static int dm_update_crtcs_state(struct dc *dc,
 
 			dc_stream_release(dm_old_crtc_state->stream);
 			dm_new_crtc_state->stream = NULL;
+
+			reset_freesync_config_for_crtc(dm_new_crtc_state);
 
 			*lock_and_validation_needed = true;
 
@@ -4520,14 +5545,19 @@ static int dm_update_crtcs_state(struct dc *dc,
 
 				WARN_ON(dm_new_crtc_state->stream);
 
+				ret = dm_atomic_get_state(state, &dm_state);
+				if (ret)
+					goto fail;
+
 				dm_new_crtc_state->stream = new_stream;
+
 				dc_stream_retain(new_stream);
 
 				DRM_DEBUG_DRIVER("Enabling DRM crtc: %d\n",
 							crtc->base.id);
 
 				if (dc_add_stream_to_ctx(
-						dc,
+						dm->dc,
 						dm_state->context,
 						dm_new_crtc_state->stream) != DC_OK) {
 					ret = -EINVAL;
@@ -4542,6 +5572,44 @@ next_crtc:
 		/* Release extra reference */
 		if (new_stream)
 			 dc_stream_release(new_stream);
+
+		/*
+		 * We want to do dc stream updates that do not require a
+		 * full modeset below.
+		 */
+		if (!(enable && aconnector && new_crtc_state->enable &&
+		      new_crtc_state->active))
+			continue;
+		/*
+		 * Given above conditions, the dc state cannot be NULL because:
+		 * 1. We're in the process of enabling CRTCs (just been added
+		 *    to the dc context, or already is on the context)
+		 * 2. Has a valid connector attached, and
+		 * 3. Is currently active and enabled.
+		 * => The dc stream state currently exists.
+		 */
+		BUG_ON(dm_new_crtc_state->stream == NULL);
+
+		/* Scaling or underscan settings */
+		if (is_scaling_state_different(dm_old_conn_state, dm_new_conn_state))
+			update_stream_scaling_settings(
+				&new_crtc_state->mode, dm_new_conn_state, dm_new_crtc_state->stream);
+
+		/*
+		 * Color management settings. We also update color properties
+		 * when a modeset is needed, to ensure it gets reprogrammed.
+		 */
+		if (dm_new_crtc_state->base.color_mgmt_changed ||
+		    drm_atomic_crtc_needs_modeset(new_crtc_state)) {
+			ret = amdgpu_dm_set_regamma_lut(dm_new_crtc_state);
+			if (ret)
+				goto fail;
+			amdgpu_dm_set_ctm(dm_new_crtc_state);
+		}
+
+		/* Update Freesync settings. */
+		get_freesync_config_for_crtc(dm_new_crtc_state,
+					     dm_new_conn_state);
 	}
 
 	return ret;
@@ -4557,23 +5625,22 @@ static int dm_update_planes_state(struct dc *dc,
 				  bool enable,
 				  bool *lock_and_validation_needed)
 {
+
+	struct dm_atomic_state *dm_state = NULL;
 	struct drm_crtc *new_plane_crtc, *old_plane_crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
 	struct drm_plane *plane;
 	struct drm_plane_state *old_plane_state, *new_plane_state;
 	struct dm_crtc_state *dm_new_crtc_state, *dm_old_crtc_state;
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
 	struct dm_plane_state *dm_new_plane_state, *dm_old_plane_state;
 	int i ;
 	/* TODO return page_flip_needed() function */
 	bool pflip_needed  = !state->allow_modeset;
 	int ret = 0;
 
-	if (pflip_needed)
-		return ret;
 
-	/* Add new planes */
-	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+	/* Add new planes, in reverse order as DC expectation */
+	for_each_oldnew_plane_in_state_reverse(state, plane, old_plane_state, new_plane_state, i) {
 		new_plane_crtc = new_plane_state->crtc;
 		old_plane_crtc = old_plane_state->crtc;
 		dm_new_plane_state = to_dm_plane_state(new_plane_state);
@@ -4585,6 +5652,9 @@ static int dm_update_planes_state(struct dc *dc,
 
 		/* Remove any changed/removed planes */
 		if (!enable) {
+			if (pflip_needed &&
+			    plane->type != DRM_PLANE_TYPE_OVERLAY)
+				continue;
 
 			if (!old_plane_crtc)
 				continue;
@@ -4596,8 +5666,12 @@ static int dm_update_planes_state(struct dc *dc,
 			if (!dm_old_crtc_state->stream)
 				continue;
 
-			DRM_DEBUG_DRIVER("Disabling DRM plane: %d on DRM crtc %d\n",
+			DRM_DEBUG_ATOMIC("Disabling DRM plane: %d on DRM crtc %d\n",
 					plane->base.id, old_plane_crtc->base.id);
+
+			ret = dm_atomic_get_state(state, &dm_state);
+			if (ret)
+				return ret;
 
 			if (!dc_remove_plane_from_context(
 					dc,
@@ -4616,6 +5690,7 @@ static int dm_update_planes_state(struct dc *dc,
 			*lock_and_validation_needed = true;
 
 		} else { /* Add new planes */
+			struct dc_plane_state *dc_new_plane_state;
 
 			if (drm_atomic_plane_disabling(plane->state, new_plane_state))
 				continue;
@@ -4629,38 +5704,58 @@ static int dm_update_planes_state(struct dc *dc,
 			if (!dm_new_crtc_state->stream)
 				continue;
 
+			if (pflip_needed &&
+			    plane->type != DRM_PLANE_TYPE_OVERLAY)
+				continue;
 
 			WARN_ON(dm_new_plane_state->dc_state);
 
-			dm_new_plane_state->dc_state = dc_create_plane_state(dc);
+			dc_new_plane_state = dc_create_plane_state(dc);
+			if (!dc_new_plane_state)
+				return -ENOMEM;
 
 			DRM_DEBUG_DRIVER("Enabling DRM plane: %d on DRM crtc %d\n",
 					plane->base.id, new_plane_crtc->base.id);
 
-			if (!dm_new_plane_state->dc_state) {
-				ret = -EINVAL;
+			ret = fill_plane_attributes(
+				new_plane_crtc->dev->dev_private,
+				dc_new_plane_state,
+				new_plane_state,
+				new_crtc_state);
+			if (ret) {
+				dc_plane_state_release(dc_new_plane_state);
 				return ret;
 			}
 
-			ret = fill_plane_attributes(
-				new_plane_crtc->dev->dev_private,
-				dm_new_plane_state->dc_state,
-				new_plane_state,
-				new_crtc_state,
-				false);
-			if (ret)
+			ret = dm_atomic_get_state(state, &dm_state);
+			if (ret) {
+				dc_plane_state_release(dc_new_plane_state);
 				return ret;
+			}
 
-
+			/*
+			 * Any atomic check errors that occur after this will
+			 * not need a release. The plane state will be attached
+			 * to the stream, and therefore part of the atomic
+			 * state. It'll be released when the atomic state is
+			 * cleaned.
+			 */
 			if (!dc_add_plane_to_context(
 					dc,
 					dm_new_crtc_state->stream,
-					dm_new_plane_state->dc_state,
+					dc_new_plane_state,
 					dm_state->context)) {
 
-				ret = -EINVAL;
-				return ret;
+				dc_plane_state_release(dc_new_plane_state);
+				return -EINVAL;
 			}
+
+			dm_new_plane_state->dc_state = dc_new_plane_state;
+
+			/* Tell DC to do a full surface update every time there
+			 * is a plane change. Inefficient, but works for now.
+			 */
+			dm_new_plane_state->dc_state->update_flags.bits.full_update = 1;
 
 			*lock_and_validation_needed = true;
 		}
@@ -4670,18 +5765,161 @@ static int dm_update_planes_state(struct dc *dc,
 	return ret;
 }
 
+static int
+dm_determine_update_type_for_commit(struct dc *dc,
+				    struct drm_atomic_state *state,
+				    enum surface_update_type *out_type)
+{
+	struct dm_atomic_state *dm_state = NULL, *old_dm_state = NULL;
+	int i, j, num_plane, ret = 0;
+	struct drm_plane_state *old_plane_state, *new_plane_state;
+	struct dm_plane_state *new_dm_plane_state, *old_dm_plane_state;
+	struct drm_crtc *new_plane_crtc, *old_plane_crtc;
+	struct drm_plane *plane;
+
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state, *old_crtc_state;
+	struct dm_crtc_state *new_dm_crtc_state, *old_dm_crtc_state;
+	struct dc_stream_status *status = NULL;
+
+	struct dc_surface_update *updates = kzalloc(MAX_SURFACES * sizeof(struct dc_surface_update), GFP_KERNEL);
+	struct dc_plane_state *surface = kzalloc(MAX_SURFACES * sizeof(struct dc_plane_state), GFP_KERNEL);
+	struct dc_stream_update stream_update;
+	enum surface_update_type update_type = UPDATE_TYPE_FAST;
+
+	if (!updates || !surface) {
+		DRM_ERROR("Plane or surface update failed to allocate");
+		/* Set type to FULL to avoid crashing in DC*/
+		update_type = UPDATE_TYPE_FULL;
+		goto cleanup;
+	}
+
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+		new_dm_crtc_state = to_dm_crtc_state(new_crtc_state);
+		old_dm_crtc_state = to_dm_crtc_state(old_crtc_state);
+		num_plane = 0;
+
+		if (new_dm_crtc_state->stream) {
+
+			for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, j) {
+				new_plane_crtc = new_plane_state->crtc;
+				old_plane_crtc = old_plane_state->crtc;
+				new_dm_plane_state = to_dm_plane_state(new_plane_state);
+				old_dm_plane_state = to_dm_plane_state(old_plane_state);
+
+				if (plane->type == DRM_PLANE_TYPE_CURSOR)
+					continue;
+
+				if (!state->allow_modeset)
+					continue;
+
+				if (crtc == new_plane_crtc) {
+					updates[num_plane].surface = &surface[num_plane];
+
+					if (new_crtc_state->mode_changed) {
+						updates[num_plane].surface->src_rect =
+									new_dm_plane_state->dc_state->src_rect;
+						updates[num_plane].surface->dst_rect =
+									new_dm_plane_state->dc_state->dst_rect;
+						updates[num_plane].surface->rotation =
+									new_dm_plane_state->dc_state->rotation;
+						updates[num_plane].surface->in_transfer_func =
+									new_dm_plane_state->dc_state->in_transfer_func;
+						stream_update.dst = new_dm_crtc_state->stream->dst;
+						stream_update.src = new_dm_crtc_state->stream->src;
+					}
+
+					if (new_crtc_state->color_mgmt_changed) {
+						updates[num_plane].gamma =
+								new_dm_plane_state->dc_state->gamma_correction;
+						updates[num_plane].in_transfer_func =
+								new_dm_plane_state->dc_state->in_transfer_func;
+						stream_update.gamut_remap =
+								&new_dm_crtc_state->stream->gamut_remap_matrix;
+						stream_update.out_transfer_func =
+								new_dm_crtc_state->stream->out_transfer_func;
+					}
+
+					num_plane++;
+				}
+			}
+
+			if (num_plane > 0) {
+				ret = dm_atomic_get_state(state, &dm_state);
+				if (ret)
+					goto cleanup;
+
+				old_dm_state = dm_atomic_get_old_state(state);
+				if (!old_dm_state) {
+					ret = -EINVAL;
+					goto cleanup;
+				}
+
+				status = dc_state_get_stream_status(old_dm_state->context,
+								    new_dm_crtc_state->stream);
+
+				update_type = dc_check_update_surfaces_for_stream(dc, updates, num_plane,
+										  &stream_update, status);
+
+				if (update_type > UPDATE_TYPE_MED) {
+					update_type = UPDATE_TYPE_FULL;
+					goto cleanup;
+				}
+			}
+
+		} else if (!new_dm_crtc_state->stream && old_dm_crtc_state->stream) {
+			update_type = UPDATE_TYPE_FULL;
+			goto cleanup;
+		}
+	}
+
+cleanup:
+	kfree(updates);
+	kfree(surface);
+
+	*out_type = update_type;
+	return ret;
+}
+
+/**
+ * amdgpu_dm_atomic_check() - Atomic check implementation for AMDgpu DM.
+ * @dev: The DRM device
+ * @state: The atomic state to commit
+ *
+ * Validate that the given atomic state is programmable by DC into hardware.
+ * This involves constructing a &struct dc_state reflecting the new hardware
+ * state we wish to commit, then querying DC to see if it is programmable. It's
+ * important not to modify the existing DC state. Otherwise, atomic_check
+ * may unexpectedly commit hardware changes.
+ *
+ * When validating the DC state, it's important that the right locks are
+ * acquired. For full updates case which removes/adds/updates streams on one
+ * CRTC while flipping on another CRTC, acquiring global lock will guarantee
+ * that any such full update commit will wait for completion of any outstanding
+ * flip using DRMs synchronization events. See
+ * dm_determine_update_type_for_commit()
+ *
+ * Note that DM adds the affected connectors for all CRTCs in state, when that
+ * might not seem necessary. This is because DC stream creation requires the
+ * DC sink, which is tied to the DRM connector state. Cleaning this up should
+ * be possible but non-trivial - a possible TODO item.
+ *
+ * Return: -Error code if validation failed.
+ */
 static int amdgpu_dm_atomic_check(struct drm_device *dev,
 				  struct drm_atomic_state *state)
 {
-	int i;
-	int ret;
 	struct amdgpu_device *adev = dev->dev_private;
+	struct dm_atomic_state *dm_state = NULL;
 	struct dc *dc = adev->dm.dc;
-	struct dm_atomic_state *dm_state = to_dm_atomic_state(state);
 	struct drm_connector *connector;
 	struct drm_connector_state *old_con_state, *new_con_state;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	enum surface_update_type update_type = UPDATE_TYPE_FAST;
+	enum surface_update_type overall_update_type = UPDATE_TYPE_FAST;
+
+	int ret, i;
 
 	/*
 	 * This bool will be set for true for any modeset/reset
@@ -4693,41 +5931,23 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 	if (ret)
 		goto fail;
 
-	/*
-	 * legacy_cursor_update should be made false for SoC's having
-	 * a dedicated hardware plane for cursor in amdgpu_dm_atomic_commit(),
-	 * otherwise for software cursor plane,
-	 * we should not add it to list of affected planes.
-	 */
-	if (state->legacy_cursor_update) {
-		for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
-			if (new_crtc_state->color_mgmt_changed) {
-				ret = drm_atomic_add_affected_planes(state, crtc);
-				if (ret)
-					goto fail;
-			}
-		}
-	} else {
-		for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
-			if (!drm_atomic_crtc_needs_modeset(new_crtc_state))
-				continue;
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+		if (!drm_atomic_crtc_needs_modeset(new_crtc_state) &&
+		    !new_crtc_state->color_mgmt_changed &&
+		    old_crtc_state->vrr_enabled == new_crtc_state->vrr_enabled)
+			continue;
 
-			if (!new_crtc_state->enable)
-				continue;
+		if (!new_crtc_state->enable)
+			continue;
 
-			ret = drm_atomic_add_affected_connectors(state, crtc);
-			if (ret)
-				return ret;
+		ret = drm_atomic_add_affected_connectors(state, crtc);
+		if (ret)
+			return ret;
 
-			ret = drm_atomic_add_affected_planes(state, crtc);
-			if (ret)
-				goto fail;
-		}
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret)
+			goto fail;
 	}
-
-	dm_state->context = dc_create_state();
-	ASSERT(dm_state->context);
-	dc_resource_state_copy_construct_current(dc, dm_state->context);
 
 	/* Remove exiting planes if they are modified */
 	ret = dm_update_planes_state(dc, state, false, &lock_and_validation_needed);
@@ -4736,13 +5956,13 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 	}
 
 	/* Disable all crtcs which require disable */
-	ret = dm_update_crtcs_state(dc, state, false, &lock_and_validation_needed);
+	ret = dm_update_crtcs_state(&adev->dm, state, false, &lock_and_validation_needed);
 	if (ret) {
 		goto fail;
 	}
 
 	/* Enable all crtcs which require enable */
-	ret = dm_update_crtcs_state(dc, state, true, &lock_and_validation_needed);
+	ret = dm_update_crtcs_state(&adev->dm, state, true, &lock_and_validation_needed);
 	if (ret) {
 		goto fail;
 	}
@@ -4759,7 +5979,7 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 		goto fail;
 
 	/* Check scaling and underscan changes*/
-	/*TODO Removed scaling changes validation due to inability to commit
+	/* TODO Removed scaling changes validation due to inability to commit
 	 * new stream into context w\o causing full reset. Need to
 	 * decide how to handle.
 	 */
@@ -4777,20 +5997,33 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 		if (!is_scaling_state_different(dm_new_con_state, dm_old_con_state))
 			continue;
 
+		overall_update_type = UPDATE_TYPE_FULL;
 		lock_and_validation_needed = true;
 	}
 
-	/*
-	 * For full updates case when
-	 * removing/adding/updating  streams on once CRTC while flipping
-	 * on another CRTC,
-	 * acquiring global lock  will guarantee that any such full
-	 * update commit
-	 * will wait for completion of any outstanding flip using DRMs
-	 * synchronization events.
-	 */
+	ret = dm_determine_update_type_for_commit(dc, state, &update_type);
+	if (ret)
+		goto fail;
 
-	if (lock_and_validation_needed) {
+	if (overall_update_type < update_type)
+		overall_update_type = update_type;
+
+	/*
+	 * lock_and_validation_needed was an old way to determine if we need to set
+	 * the global lock. Leaving it in to check if we broke any corner cases
+	 * lock_and_validation_needed true = UPDATE_TYPE_FULL or UPDATE_TYPE_MED
+	 * lock_and_validation_needed false = UPDATE_TYPE_FAST
+	 */
+	if (lock_and_validation_needed && overall_update_type <= UPDATE_TYPE_FAST)
+		WARN(1, "Global lock should be Set, overall_update_type should be UPDATE_TYPE_MED or UPDATE_TYPE_FULL");
+	else if (!lock_and_validation_needed && overall_update_type > UPDATE_TYPE_FAST)
+		WARN(1, "Global lock should NOT be set, overall_update_type should be UPDATE_TYPE_FAST");
+
+
+	if (overall_update_type > UPDATE_TYPE_FAST) {
+		ret = dm_atomic_get_state(state, &dm_state);
+		if (ret)
+			goto fail;
 
 		ret = do_aquire_global_lock(dev, state);
 		if (ret)
@@ -4800,6 +6033,13 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 			ret = -EINVAL;
 			goto fail;
 		}
+	} else if (state->legacy_cursor_update) {
+		/*
+		 * This is a fast cursor update coming from the plane update
+		 * helper, check if it can be done asynchronously for better
+		 * performance.
+		 */
+		state->async_update = !drm_atomic_helper_async_check(dev, state);
 	}
 
 	/* Must be success */
@@ -4835,28 +6075,46 @@ static bool is_dp_capable_without_timing_msa(struct dc *dc,
 
 	return capable;
 }
-void amdgpu_dm_add_sink_to_freesync_module(struct drm_connector *connector,
-					   struct edid *edid)
+void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+					struct edid *edid)
 {
 	int i;
-	uint64_t val_capable;
 	bool edid_check_required;
 	struct detailed_timing *timing;
 	struct detailed_non_pixel *data;
 	struct detailed_data_monitor_range *range;
 	struct amdgpu_dm_connector *amdgpu_dm_connector =
 			to_amdgpu_dm_connector(connector);
+	struct dm_connector_state *dm_con_state = NULL;
 
 	struct drm_device *dev = connector->dev;
 	struct amdgpu_device *adev = dev->dev_private;
+	bool freesync_capable = false;
+
+	if (!connector->state) {
+		DRM_ERROR("%s - Connector has no state", __func__);
+		goto update;
+	}
+
+	if (!edid) {
+		dm_con_state = to_dm_connector_state(connector->state);
+
+		amdgpu_dm_connector->min_vfreq = 0;
+		amdgpu_dm_connector->max_vfreq = 0;
+		amdgpu_dm_connector->pixel_clock_mhz = 0;
+
+		goto update;
+	}
+
+	dm_con_state = to_dm_connector_state(connector->state);
 
 	edid_check_required = false;
 	if (!amdgpu_dm_connector->dc_sink) {
 		DRM_ERROR("dc_sink NULL, could not add free_sync module.\n");
-		return;
+		goto update;
 	}
 	if (!adev->dm.freesync_module)
-		return;
+		goto update;
 	/*
 	 * if edid non zero restrict freesync only for dp and edp
 	 */
@@ -4868,7 +6126,6 @@ void amdgpu_dm_add_sink_to_freesync_module(struct drm_connector *connector,
 						amdgpu_dm_connector);
 		}
 	}
-	val_capable = 0;
 	if (edid_check_required == true && (edid->version > 1 ||
 	   (edid->version == 1 && edid->revision > 1))) {
 		for (i = 0; i < 4; i++) {
@@ -4898,28 +6155,18 @@ void amdgpu_dm_add_sink_to_freesync_module(struct drm_connector *connector,
 		}
 
 		if (amdgpu_dm_connector->max_vfreq -
-				amdgpu_dm_connector->min_vfreq > 10) {
-			amdgpu_dm_connector->caps.supported = true;
-			amdgpu_dm_connector->caps.min_refresh_in_micro_hz =
-					amdgpu_dm_connector->min_vfreq * 1000000;
-			amdgpu_dm_connector->caps.max_refresh_in_micro_hz =
-					amdgpu_dm_connector->max_vfreq * 1000000;
-				val_capable = 1;
+		    amdgpu_dm_connector->min_vfreq > 10) {
+
+			freesync_capable = true;
 		}
 	}
 
-	/*
-	 * TODO figure out how to notify user-mode or DRM of freesync caps
-	 * once we figure out how to deal with freesync in an upstreamable
-	 * fashion
-	 */
+update:
+	if (dm_con_state)
+		dm_con_state->freesync_capable = freesync_capable;
 
+	if (connector->vrr_capable_property)
+		drm_connector_set_vrr_capable_property(connector,
+						       freesync_capable);
 }
 
-void amdgpu_dm_remove_sink_from_freesync_module(struct drm_connector *connector)
-{
-	/*
-	 * TODO fill in once we figure out how to deal with freesync in
-	 * an upstreamable fashion
-	 */
-}

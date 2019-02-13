@@ -1,4 +1,5 @@
-generic-y += clkdev.h
+generated-y += syscall_table.h
+generic-y += compat.h
 generic-y += exec.h
 generic-y += irq_work.h
 generic-y += mcs_spinlock.h

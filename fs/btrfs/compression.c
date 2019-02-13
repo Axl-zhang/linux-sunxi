@@ -1,24 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2008 Oracle.  All rights reserved.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License v2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public
- * License along with this program; if not, write to the
- * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
- * Boston, MA 021110-1307, USA.
  */
 
 #include <linux/kernel.h>
 #include <linux/bio.h>
-#include <linux/buffer_head.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
@@ -27,13 +13,9 @@
 #include <linux/init.h>
 #include <linux/string.h>
 #include <linux/backing-dev.h>
-#include <linux/mpage.h>
-#include <linux/swap.h>
 #include <linux/writeback.h>
-#include <linux/bit_spinlock.h>
 #include <linux/slab.h>
 #include <linux/sched/mm.h>
-#include <linux/sort.h>
 #include <linux/log2.h>
 #include "ctree.h"
 #include "disk-io.h"
@@ -44,6 +26,21 @@
 #include "compression.h"
 #include "extent_io.h"
 #include "extent_map.h"
+
+static const char* const btrfs_compress_types[] = { "", "zlib", "lzo", "zstd" };
+
+const char* btrfs_compress_type2str(enum btrfs_compression_type type)
+{
+	switch (type) {
+	case BTRFS_COMPRESS_ZLIB:
+	case BTRFS_COMPRESS_LZO:
+	case BTRFS_COMPRESS_ZSTD:
+	case BTRFS_COMPRESS_NONE:
+		return btrfs_compress_types[type];
+	}
+
+	return NULL;
+}
 
 static int btrfs_decompress_bio(struct compressed_bio *cb);
 
@@ -232,7 +229,6 @@ static noinline void end_compressed_writeback(struct inode *inode,
  */
 static void end_compressed_bio_write(struct bio *bio)
 {
-	struct extent_io_tree *tree;
 	struct compressed_bio *cb = bio->bi_private;
 	struct inode *inode;
 	struct page *page;
@@ -251,14 +247,10 @@ static void end_compressed_bio_write(struct bio *bio)
 	 * call back into the FS and do all the end_io operations
 	 */
 	inode = cb->inode;
-	tree = &BTRFS_I(inode)->io_tree;
 	cb->compressed_pages[0]->mapping = cb->inode->i_mapping;
-	tree->ops->writepage_end_io_hook(cb->compressed_pages[0],
-					 cb->start,
-					 cb->start + cb->len - 1,
-					 NULL,
-					 bio->bi_status ?
-					 BLK_STS_OK : BLK_STS_NOTSUPP);
+	btrfs_writepage_endio_finish_ordered(cb->compressed_pages[0],
+			cb->start, cb->start + cb->len - 1,
+			bio->bi_status ? BLK_STS_OK : BLK_STS_NOTSUPP);
 	cb->compressed_pages[0]->mapping = NULL;
 
 	end_compressed_writeback(inode, cb);
@@ -295,13 +287,13 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 				 unsigned long len, u64 disk_start,
 				 unsigned long compressed_len,
 				 struct page **compressed_pages,
-				 unsigned long nr_pages)
+				 unsigned long nr_pages,
+				 unsigned int write_flags)
 {
 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
 	struct bio *bio = NULL;
 	struct compressed_bio *cb;
 	unsigned long bytes_left;
-	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
 	int pg_index = 0;
 	struct page *page;
 	u64 first_byte = disk_start;
@@ -309,7 +301,7 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 	blk_status_t ret;
 	int skip_sum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
 
-	WARN_ON(start & ((u64)PAGE_SIZE - 1));
+	WARN_ON(!PAGE_ALIGNED(start));
 	cb = kmalloc(compressed_bio_size(fs_info, compressed_len), GFP_NOFS);
 	if (!cb)
 		return BLK_STS_RESOURCE;
@@ -327,7 +319,7 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 	bdev = fs_info->fs_devices->latest_bdev;
 
 	bio = btrfs_bio_alloc(bdev, first_byte);
-	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+	bio->bi_opf = REQ_OP_WRITE | write_flags;
 	bio->bi_private = cb;
 	bio->bi_end_io = end_compressed_bio_write;
 	refcount_set(&cb->pending_bios, 1);
@@ -340,15 +332,12 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 		page = compressed_pages[pg_index];
 		page->mapping = inode->i_mapping;
 		if (bio->bi_iter.bi_size)
-			submit = io_tree->ops->merge_bio_hook(page, 0,
-							   PAGE_SIZE,
-							   bio, 0);
+			submit = btrfs_bio_fits_in_stripe(page, PAGE_SIZE, bio,
+							  0);
 
 		page->mapping = NULL;
 		if (submit || bio_add_page(bio, page, PAGE_SIZE, 0) <
 		    PAGE_SIZE) {
-			bio_get(bio);
-
 			/*
 			 * inc the count before we submit the bio so
 			 * we know the end IO handler won't happen before
@@ -371,10 +360,8 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 				bio_endio(bio);
 			}
 
-			bio_put(bio);
-
 			bio = btrfs_bio_alloc(bdev, first_byte);
-			bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+			bio->bi_opf = REQ_OP_WRITE | write_flags;
 			bio->bi_private = cb;
 			bio->bi_end_io = end_compressed_bio_write;
 			bio_add_page(bio, page, PAGE_SIZE, 0);
@@ -388,7 +375,6 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 		first_byte += PAGE_SIZE;
 		cond_resched();
 	}
-	bio_get(bio);
 
 	ret = btrfs_bio_wq_end_io(fs_info, bio, BTRFS_WQ_ENDIO_DATA);
 	BUG_ON(ret); /* -ENOMEM */
@@ -404,13 +390,12 @@ blk_status_t btrfs_submit_compressed_write(struct inode *inode, u64 start,
 		bio_endio(bio);
 	}
 
-	bio_put(bio);
 	return 0;
 }
 
 static u64 bio_end_offset(struct bio *bio)
 {
-	struct bio_vec *last = &bio->bi_io_vec[bio->bi_vcnt - 1];
+	struct bio_vec *last = bio_last_bvec_all(bio);
 
 	return page_offset(last->bv_page) + last->bv_len + last->bv_offset;
 }
@@ -448,10 +433,8 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 		if (pg_index > end_index)
 			break;
 
-		rcu_read_lock();
-		page = radix_tree_lookup(&mapping->page_tree, pg_index);
-		rcu_read_unlock();
-		if (page && !radix_tree_exceptional_entry(page)) {
+		page = xa_load(&mapping->i_pages, pg_index);
+		if (page && !xa_is_value(page)) {
 			misses++;
 			if (misses > 4)
 				break;
@@ -494,7 +477,7 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 
 		if (page->index == end_index) {
 			char *userpage;
-			size_t zero_offset = isize & (PAGE_SIZE - 1);
+			size_t zero_offset = offset_in_page(isize);
 
 			if (zero_offset) {
 				int zeros;
@@ -539,7 +522,6 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 				 int mirror_num, unsigned long bio_flags)
 {
 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
-	struct extent_io_tree *tree;
 	struct extent_map_tree *em_tree;
 	struct compressed_bio *cb;
 	unsigned long compressed_len;
@@ -556,13 +538,12 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 	int faili = 0;
 	u32 *sums;
 
-	tree = &BTRFS_I(inode)->io_tree;
 	em_tree = &BTRFS_I(inode)->extent_tree;
 
 	/* we need the actual starting offset of this extent in the file */
 	read_lock(&em_tree->lock);
 	em = lookup_extent_mapping(em_tree,
-				   page_offset(bio->bi_io_vec->bv_page),
+				   page_offset(bio_first_page_all(bio)),
 				   PAGE_SIZE);
 	read_unlock(&em_tree->lock);
 	if (!em)
@@ -617,7 +598,7 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 	cb->len = bio->bi_iter.bi_size;
 
 	comp_bio = btrfs_bio_alloc(bdev, cur_disk_byte);
-	bio_set_op_attrs (comp_bio, REQ_OP_READ, 0);
+	comp_bio->bi_opf = REQ_OP_READ;
 	comp_bio->bi_private = cb;
 	comp_bio->bi_end_io = end_compressed_bio_read;
 	refcount_set(&cb->pending_bios, 1);
@@ -630,15 +611,12 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 		page->index = em_start >> PAGE_SHIFT;
 
 		if (comp_bio->bi_iter.bi_size)
-			submit = tree->ops->merge_bio_hook(page, 0,
-							PAGE_SIZE,
-							comp_bio, 0);
+			submit = btrfs_bio_fits_in_stripe(page, PAGE_SIZE,
+							  comp_bio, 0);
 
 		page->mapping = NULL;
 		if (submit || bio_add_page(comp_bio, page, PAGE_SIZE, 0) <
 		    PAGE_SIZE) {
-			bio_get(comp_bio);
-
 			ret = btrfs_bio_wq_end_io(fs_info, comp_bio,
 						  BTRFS_WQ_ENDIO_DATA);
 			BUG_ON(ret); /* -ENOMEM */
@@ -665,10 +643,8 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 				bio_endio(comp_bio);
 			}
 
-			bio_put(comp_bio);
-
 			comp_bio = btrfs_bio_alloc(bdev, cur_disk_byte);
-			bio_set_op_attrs(comp_bio, REQ_OP_READ, 0);
+			comp_bio->bi_opf = REQ_OP_READ;
 			comp_bio->bi_private = cb;
 			comp_bio->bi_end_io = end_compressed_bio_read;
 
@@ -676,7 +652,6 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 		}
 		cur_disk_byte += PAGE_SIZE;
 	}
-	bio_get(comp_bio);
 
 	ret = btrfs_bio_wq_end_io(fs_info, comp_bio, BTRFS_WQ_ENDIO_DATA);
 	BUG_ON(ret); /* -ENOMEM */
@@ -692,7 +667,6 @@ blk_status_t btrfs_submit_compressed_read(struct inode *inode, struct bio *bio,
 		bio_endio(comp_bio);
 	}
 
-	bio_put(comp_bio);
 	return 0;
 
 fail2:
@@ -751,6 +725,8 @@ struct heuristic_ws {
 	u32 sample_size;
 	/* Buckets store counters for each byte value */
 	struct bucket_item *bucket;
+	/* Sorting buffer */
+	struct bucket_item *bucket_b;
 	struct list_head list;
 };
 
@@ -762,6 +738,7 @@ static void free_heuristic_ws(struct list_head *ws)
 
 	kvfree(workspace->sample);
 	kfree(workspace->bucket);
+	kfree(workspace->bucket_b);
 	kfree(workspace);
 }
 
@@ -779,6 +756,10 @@ static struct list_head *alloc_heuristic_ws(void)
 
 	ws->bucket = kcalloc(BUCKET_SIZE, sizeof(*ws->bucket), GFP_KERNEL);
 	if (!ws->bucket)
+		goto fail;
+
+	ws->bucket_b = kcalloc(BUCKET_SIZE, sizeof(*ws->bucket_b), GFP_KERNEL);
+	if (!ws->bucket_b)
 		goto fail;
 
 	INIT_LIST_HEAD(&ws->list);
@@ -993,12 +974,7 @@ static void __free_workspace(int type, struct list_head *workspace,
 		btrfs_compress_op[idx]->free_workspace(workspace);
 	atomic_dec(total_ws);
 wake:
-	/*
-	 * Make sure counter is updated before we wake up waiters.
-	 */
-	smp_mb();
-	if (waitqueue_active(ws_wait))
-		wake_up(ws_wait);
+	cond_wake_up(ws_wait);
 }
 
 static void free_workspace(int type, struct list_head *ws)
@@ -1123,7 +1099,7 @@ int btrfs_decompress(int type, unsigned char *data_in, struct page *dest_page,
 	return ret;
 }
 
-void btrfs_exit_compress(void)
+void __cold btrfs_exit_compress(void)
 {
 	free_workspaces();
 }
@@ -1227,7 +1203,7 @@ int btrfs_decompress_buf2page(const char *buf, unsigned long buf_start,
 /*
  * Shannon Entropy calculation
  *
- * Pure byte distribution analysis fails to determine compressiability of data.
+ * Pure byte distribution analysis fails to determine compressibility of data.
  * Try calculating entropy to estimate the average minimum number of bits
  * needed to encode the sampled data.
  *
@@ -1277,13 +1253,103 @@ static u32 shannon_entropy(struct heuristic_ws *ws)
 	return entropy_sum * 100 / entropy_max;
 }
 
-/* Compare buckets by size, ascending */
-static int bucket_comp_rev(const void *lv, const void *rv)
-{
-	const struct bucket_item *l = (const struct bucket_item *)lv;
-	const struct bucket_item *r = (const struct bucket_item *)rv;
+#define RADIX_BASE		4U
+#define COUNTERS_SIZE		(1U << RADIX_BASE)
 
-	return r->count - l->count;
+static u8 get4bits(u64 num, int shift) {
+	u8 low4bits;
+
+	num >>= shift;
+	/* Reverse order */
+	low4bits = (COUNTERS_SIZE - 1) - (num % COUNTERS_SIZE);
+	return low4bits;
+}
+
+/*
+ * Use 4 bits as radix base
+ * Use 16 u32 counters for calculating new position in buf array
+ *
+ * @array     - array that will be sorted
+ * @array_buf - buffer array to store sorting results
+ *              must be equal in size to @array
+ * @num       - array size
+ */
+static void radix_sort(struct bucket_item *array, struct bucket_item *array_buf,
+		       int num)
+{
+	u64 max_num;
+	u64 buf_num;
+	u32 counters[COUNTERS_SIZE];
+	u32 new_addr;
+	u32 addr;
+	int bitlen;
+	int shift;
+	int i;
+
+	/*
+	 * Try avoid useless loop iterations for small numbers stored in big
+	 * counters.  Example: 48 33 4 ... in 64bit array
+	 */
+	max_num = array[0].count;
+	for (i = 1; i < num; i++) {
+		buf_num = array[i].count;
+		if (buf_num > max_num)
+			max_num = buf_num;
+	}
+
+	buf_num = ilog2(max_num);
+	bitlen = ALIGN(buf_num, RADIX_BASE * 2);
+
+	shift = 0;
+	while (shift < bitlen) {
+		memset(counters, 0, sizeof(counters));
+
+		for (i = 0; i < num; i++) {
+			buf_num = array[i].count;
+			addr = get4bits(buf_num, shift);
+			counters[addr]++;
+		}
+
+		for (i = 1; i < COUNTERS_SIZE; i++)
+			counters[i] += counters[i - 1];
+
+		for (i = num - 1; i >= 0; i--) {
+			buf_num = array[i].count;
+			addr = get4bits(buf_num, shift);
+			counters[addr]--;
+			new_addr = counters[addr];
+			array_buf[new_addr] = array[i];
+		}
+
+		shift += RADIX_BASE;
+
+		/*
+		 * Normal radix expects to move data from a temporary array, to
+		 * the main one.  But that requires some CPU time. Avoid that
+		 * by doing another sort iteration to original array instead of
+		 * memcpy()
+		 */
+		memset(counters, 0, sizeof(counters));
+
+		for (i = 0; i < num; i ++) {
+			buf_num = array_buf[i].count;
+			addr = get4bits(buf_num, shift);
+			counters[addr]++;
+		}
+
+		for (i = 1; i < COUNTERS_SIZE; i++)
+			counters[i] += counters[i - 1];
+
+		for (i = num - 1; i >= 0; i--) {
+			buf_num = array_buf[i].count;
+			addr = get4bits(buf_num, shift);
+			counters[addr]--;
+			new_addr = counters[addr];
+			array[new_addr] = array_buf[i];
+		}
+
+		shift += RADIX_BASE;
+	}
 }
 
 /*
@@ -1313,7 +1379,7 @@ static int byte_core_set_size(struct heuristic_ws *ws)
 	struct bucket_item *bucket = ws->bucket;
 
 	/* Sort in reverse order */
-	sort(bucket, BUCKET_SIZE, sizeof(*bucket), &bucket_comp_rev, NULL);
+	radix_sort(ws->bucket, ws->bucket_b, BUCKET_SIZE);
 
 	for (i = 0; i < BYTE_CORE_SET_LOW; i++)
 		coreset_sum += bucket[i].count;
@@ -1528,5 +1594,5 @@ unsigned int btrfs_compress_str2level(const char *str)
 	if (str[4] == ':' && '1' <= str[5] && str[5] <= '9' && str[6] == 0)
 		return str[5] - '0';
 
-	return 0;
+	return BTRFS_ZLIB_DEFAULT_LEVEL;
 }

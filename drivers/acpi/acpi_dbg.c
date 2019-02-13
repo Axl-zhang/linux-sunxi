@@ -614,7 +614,7 @@ static ssize_t acpi_aml_read(struct file *file, char __user *buf,
 
 	if (!count)
 		return 0;
-	if (!access_ok(VERIFY_WRITE, buf, count))
+	if (!access_ok(buf, count))
 		return -EFAULT;
 
 	while (count > 0) {
@@ -684,7 +684,7 @@ static ssize_t acpi_aml_write(struct file *file, const char __user *buf,
 
 	if (!count)
 		return 0;
-	if (!access_ok(VERIFY_READ, buf, count))
+	if (!access_ok(buf, count))
 		return -EFAULT;
 
 	while (count > 0) {
@@ -718,15 +718,15 @@ again:
 	return size > 0 ? size : ret;
 }
 
-static unsigned int acpi_aml_poll(struct file *file, poll_table *wait)
+static __poll_t acpi_aml_poll(struct file *file, poll_table *wait)
 {
-	int masks = 0;
+	__poll_t masks = 0;
 
 	poll_wait(file, &acpi_aml_io.wait, wait);
 	if (acpi_aml_user_readable())
-		masks |= POLLIN | POLLRDNORM;
+		masks |= EPOLLIN | EPOLLRDNORM;
 	if (acpi_aml_user_writable())
-		masks |= POLLOUT | POLLWRNORM;
+		masks |= EPOLLOUT | EPOLLWRNORM;
 
 	return masks;
 }

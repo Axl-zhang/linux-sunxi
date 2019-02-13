@@ -23,6 +23,7 @@
 #include <linux/export.h>
 #include <linux/freezer.h>
 #include <linux/wait.h>
+#include <linux/iversion.h>
 
 #include <linux/uaccess.h>
 
@@ -230,6 +231,7 @@ static void nfs_grow_file(struct page *page, unsigned int offset, unsigned int c
 	if (i_size >= end)
 		goto out;
 	i_size_write(inode, end);
+	NFS_I(inode)->cache_validity &= ~NFS_INO_INVALID_SIZE;
 	nfs_inc_stats(inode, NFSIOS_EXTENDWRITE);
 out:
 	spin_unlock(&inode->i_lock);
@@ -619,11 +621,12 @@ static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
 	nfs_set_page_writeback(page);
 	WARN_ON_ONCE(test_bit(PG_CLEAN, &req->wb_flags));
 
-	ret = 0;
+	ret = req->wb_context->error;
 	/* If there is a fatal error that covers this write, just exit */
-	if (nfs_error_is_fatal_on_server(req->wb_context->error))
+	if (nfs_error_is_fatal_on_server(ret))
 		goto out_launder;
 
+	ret = 0;
 	if (!nfs_pageio_add_request(pgio, req)) {
 		ret = pgio->pg_error;
 		/*
@@ -633,9 +636,9 @@ static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
 			nfs_context_set_write_error(req->wb_context, ret);
 			if (nfs_error_is_fatal_on_server(ret))
 				goto out_launder;
-		}
+		} else
+			ret = -EAGAIN;
 		nfs_redirty_request(req);
-		ret = -EAGAIN;
 	} else
 		nfs_add_stats(page_file_mapping(page)->host,
 				NFSIOS_WRITEPAGES, 1);
@@ -753,11 +756,8 @@ static void nfs_inode_add_request(struct inode *inode, struct nfs_page *req)
 	 */
 	spin_lock(&mapping->private_lock);
 	if (!nfs_have_writebacks(inode) &&
-	    NFS_PROTO(inode)->have_delegation(inode, FMODE_WRITE)) {
-		spin_lock(&inode->i_lock);
-		inode->i_version++;
-		spin_unlock(&inode->i_lock);
-	}
+	    NFS_PROTO(inode)->have_delegation(inode, FMODE_WRITE))
+		inode_inc_iversion_raw(inode);
 	if (likely(!PageSwapCache(req->wb_page))) {
 		set_bit(PG_MAPPED, &req->wb_flags);
 		SetPagePrivate(req->wb_page);
@@ -1234,9 +1234,12 @@ int
 nfs_key_timeout_notify(struct file *filp, struct inode *inode)
 {
 	struct nfs_open_context *ctx = nfs_file_open_context(filp);
-	struct rpc_auth *auth = NFS_SERVER(inode)->client->cl_auth;
 
-	return rpcauth_key_timeout_notify(auth, ctx->cred);
+	if (nfs_ctx_key_to_expire(ctx, inode) &&
+	    !ctx->ll_cred)
+		/* Already expired! */
+		return -EACCES;
+	return 0;
 }
 
 /*
@@ -1245,8 +1248,23 @@ nfs_key_timeout_notify(struct file *filp, struct inode *inode)
 bool nfs_ctx_key_to_expire(struct nfs_open_context *ctx, struct inode *inode)
 {
 	struct rpc_auth *auth = NFS_SERVER(inode)->client->cl_auth;
+	struct rpc_cred *cred = ctx->ll_cred;
+	struct auth_cred acred = {
+		.cred = ctx->cred,
+	};
 
-	return rpcauth_cred_key_to_expire(auth, ctx->cred);
+	if (cred && !cred->cr_ops->crmatch(&acred, cred, 0)) {
+		put_rpccred(cred);
+		ctx->ll_cred = NULL;
+		cred = NULL;
+	}
+	if (!cred)
+		cred = auth->au_ops->lookup_cred(auth, &acred, 0);
+	if (!cred || IS_ERR(cred))
+		return true;
+	ctx->ll_cred = cred;
+	return !!(cred->cr_ops->crkey_timeout &&
+		  cred->cr_ops->crkey_timeout(cred));
 }
 
 /*
@@ -1376,12 +1394,9 @@ static void nfs_initiate_write(struct nfs_pgio_header *hdr,
 	int priority = flush_task_priority(how);
 
 	task_setup_data->priority = priority;
-	rpc_ops->write_setup(hdr, msg);
+	rpc_ops->write_setup(hdr, msg, &task_setup_data->rpc_client);
 	trace_nfs_initiate_write(hdr->inode, hdr->io_start, hdr->good_bytes,
 				 hdr->args.stable);
-
-	nfs4_state_protect_write(NFS_SERVER(hdr->inode)->nfs_client,
-				 &task_setup_data->rpc_client, msg, hdr);
 }
 
 /* If a nfs_flush_* function fails, it should remove reqs from @head and
@@ -1410,6 +1425,8 @@ static void nfs_async_write_error(struct list_head *head)
 static void nfs_async_write_reschedule_io(struct nfs_pgio_header *hdr)
 {
 	nfs_async_write_error(&hdr->pages);
+	filemap_fdatawrite_range(hdr->inode->i_mapping, hdr->args.offset,
+			hdr->args.offset + hdr->args.count - 1);
 }
 
 static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops = {
@@ -1564,8 +1581,11 @@ static int nfs_writeback_done(struct rpc_task *task,
 	}
 
 	/* Deal with the suid/sgid bit corner case */
-	if (nfs_should_remove_suid(inode))
-		nfs_mark_for_revalidate(inode);
+	if (nfs_should_remove_suid(inode)) {
+		spin_lock(&inode->i_lock);
+		NFS_I(inode)->cache_validity |= NFS_INO_INVALID_OTHER;
+		spin_unlock(&inode->i_lock);
+	}
 	return 0;
 }
 
@@ -1622,8 +1642,8 @@ static void nfs_writeback_result(struct rpc_task *task,
 
 static int wait_on_commit(struct nfs_mds_commit_info *cinfo)
 {
-	return wait_on_atomic_t(&cinfo->rpcs_out,
-			nfs_wait_atomic_killable, TASK_KILLABLE);
+	return wait_var_event_killable(&cinfo->rpcs_out,
+				       !atomic_read(&cinfo->rpcs_out));
 }
 
 static void nfs_commit_begin(struct nfs_mds_commit_info *cinfo)
@@ -1634,7 +1654,7 @@ static void nfs_commit_begin(struct nfs_mds_commit_info *cinfo)
 static void nfs_commit_end(struct nfs_mds_commit_info *cinfo)
 {
 	if (atomic_dec_and_test(&cinfo->rpcs_out))
-		wake_up_atomic_t(&cinfo->rpcs_out);
+		wake_up_var(&cinfo->rpcs_out);
 }
 
 void nfs_commitdata_release(struct nfs_commit_data *data)
@@ -1667,13 +1687,10 @@ int nfs_initiate_commit(struct rpc_clnt *clnt, struct nfs_commit_data *data,
 		.priority = priority,
 	};
 	/* Set up the initial task struct.  */
-	nfs_ops->commit_setup(data, &msg);
+	nfs_ops->commit_setup(data, &msg, &task_setup_data.rpc_client);
 	trace_nfs_initiate_commit(data);
 
 	dprintk("NFS: initiated commit call\n");
-
-	nfs4_state_protect(NFS_SERVER(data->inode)->nfs_client,
-		NFS_SP4_MACH_CRED_COMMIT, &task_setup_data.rpc_client, &msg);
 
 	task = rpc_run_task(&task_setup_data);
 	if (IS_ERR(task))
@@ -1837,6 +1854,8 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 		set_bit(NFS_CONTEXT_RESEND_WRITES, &req->wb_context->flags);
 	next:
 		nfs_unlock_and_release_request(req);
+		/* Latency breaker */
+		cond_resched();
 	}
 	nfss = NFS_SERVER(data->inode);
 	if (atomic_long_read(&nfss->writeback) < NFS_CONGESTION_OFF_THRESH)
@@ -1876,38 +1895,43 @@ int nfs_generic_commit_list(struct inode *inode, struct list_head *head,
 	return status;
 }
 
-int nfs_commit_inode(struct inode *inode, int how)
+static int __nfs_commit_inode(struct inode *inode, int how,
+		struct writeback_control *wbc)
 {
 	LIST_HEAD(head);
 	struct nfs_commit_info cinfo;
 	int may_wait = how & FLUSH_SYNC;
-	int error = 0;
-	int res;
+	int ret, nscan;
 
 	nfs_init_cinfo_from_inode(&cinfo, inode);
 	nfs_commit_begin(cinfo.mds);
-	res = nfs_scan_commit(inode, &head, &cinfo);
-	if (res)
-		error = nfs_generic_commit_list(inode, &head, how, &cinfo);
+	for (;;) {
+		ret = nscan = nfs_scan_commit(inode, &head, &cinfo);
+		if (ret <= 0)
+			break;
+		ret = nfs_generic_commit_list(inode, &head, how, &cinfo);
+		if (ret < 0)
+			break;
+		ret = 0;
+		if (wbc && wbc->sync_mode == WB_SYNC_NONE) {
+			if (nscan < wbc->nr_to_write)
+				wbc->nr_to_write -= nscan;
+			else
+				wbc->nr_to_write = 0;
+		}
+		if (nscan < INT_MAX)
+			break;
+		cond_resched();
+	}
 	nfs_commit_end(cinfo.mds);
-	if (error < 0)
-		goto out_error;
-	if (!may_wait)
-		goto out_mark_dirty;
-	error = wait_on_commit(cinfo.mds);
-	if (error < 0)
-		return error;
-	return res;
-out_error:
-	res = error;
-	/* Note: If we exit without ensuring that the commit is complete,
-	 * we must mark the inode as dirty. Otherwise, future calls to
-	 * sync_inode() with the WB_SYNC_ALL flag set will fail to ensure
-	 * that the data is on the disk.
-	 */
-out_mark_dirty:
-	__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
-	return res;
+	if (ret || !may_wait)
+		return ret;
+	return wait_on_commit(cinfo.mds);
+}
+
+int nfs_commit_inode(struct inode *inode, int how)
+{
+	return __nfs_commit_inode(inode, how, NULL);
 }
 EXPORT_SYMBOL_GPL(nfs_commit_inode);
 
@@ -1917,11 +1941,11 @@ int nfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	int flags = FLUSH_SYNC;
 	int ret = 0;
 
-	/* no commits means nothing needs to be done */
-	if (!atomic_long_read(&nfsi->commit_info.ncommit))
-		return ret;
-
 	if (wbc->sync_mode == WB_SYNC_NONE) {
+		/* no commits means nothing needs to be done */
+		if (!atomic_long_read(&nfsi->commit_info.ncommit))
+			goto check_requests_outstanding;
+
 		/* Don't commit yet if this is a non-blocking flush and there
 		 * are a lot of outstanding writes for this mapping.
 		 */
@@ -1932,16 +1956,16 @@ int nfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 		flags = 0;
 	}
 
-	ret = nfs_commit_inode(inode, flags);
-	if (ret >= 0) {
-		if (wbc->sync_mode == WB_SYNC_NONE) {
-			if (ret < wbc->nr_to_write)
-				wbc->nr_to_write -= ret;
-			else
-				wbc->nr_to_write = 0;
-		}
-		return 0;
-	}
+	ret = __nfs_commit_inode(inode, flags, wbc);
+	if (!ret) {
+		if (flags & FLUSH_SYNC)
+			return 0;
+	} else if (atomic_long_read(&nfsi->commit_info.ncommit))
+		goto out_mark_dirty;
+
+check_requests_outstanding:
+	if (!atomic_read(&nfsi->commit_info.rpcs_out))
+		return ret;
 out_mark_dirty:
 	__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
 	return ret;
@@ -2116,7 +2140,7 @@ int __init nfs_init_writepagecache(void)
 	 * This allows larger machines to have larger/more transfers.
 	 * Limit the default to 256M
 	 */
-	nfs_congestion_kb = (16*int_sqrt(totalram_pages)) << (PAGE_SHIFT-10);
+	nfs_congestion_kb = (16*int_sqrt(totalram_pages())) << (PAGE_SHIFT-10);
 	if (nfs_congestion_kb > 256*1024)
 		nfs_congestion_kb = 256*1024;
 

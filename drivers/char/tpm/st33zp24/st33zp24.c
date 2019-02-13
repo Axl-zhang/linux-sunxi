@@ -373,8 +373,6 @@ static int st33zp24_send(struct tpm_chip *chip, unsigned char *buf,
 	int ret;
 	u8 data;
 
-	if (!chip)
-		return -EBUSY;
 	if (len < TPM_HEADER_SIZE)
 		return -EBUSY;
 
@@ -457,7 +455,7 @@ static int st33zp24_recv(struct tpm_chip *chip, unsigned char *buf,
 			    size_t count)
 {
 	int size = 0;
-	int expected;
+	u32 expected;
 
 	if (!chip)
 		return -EBUSY;
@@ -474,7 +472,7 @@ static int st33zp24_recv(struct tpm_chip *chip, unsigned char *buf,
 	}
 
 	expected = be32_to_cpu(*(__be32 *)(buf + 2));
-	if (expected > count) {
+	if (expected > count || expected < TPM_HEADER_SIZE) {
 		size = -EIO;
 		goto out;
 	}
@@ -651,7 +649,7 @@ int st33zp24_pm_resume(struct device *dev)
 	} else {
 		ret = tpm_pm_resume(dev);
 		if (!ret)
-			tpm_do_selftest(chip);
+			tpm1_do_selftest(chip);
 	}
 	return ret;
 } /* st33zp24_pm_resume() */

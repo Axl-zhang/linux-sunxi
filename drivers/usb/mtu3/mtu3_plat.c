@@ -200,6 +200,14 @@ static void ssusb_ip_sw_reset(struct ssusb_mtk *ssusb)
 	mtu3_setbits(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0, SSUSB_IP_SW_RST);
 	udelay(1);
 	mtu3_clrbits(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0, SSUSB_IP_SW_RST);
+
+	/*
+	 * device ip may be powered on in firmware/BROM stage before entering
+	 * kernel stage;
+	 * power down device ip, otherwise ip-sleep will fail when working as
+	 * host only mode
+	 */
+	mtu3_setbits(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL2, SSUSB_IP_DEV_PDN);
 }
 
 /* ignore the error if the clock does not exist */
@@ -282,8 +290,10 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 
 	/* if host role is supported */
 	ret = ssusb_wakeup_of_property_parse(ssusb, node);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "failed to parse uwk property\n");
 		return ret;
+	}
 
 	/* optional property, ignore the error if it does not exist */
 	of_property_read_u32(node, "mediatek,u3p-dis-msk",
@@ -308,7 +318,7 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 		otg_sx->edev = extcon_get_edev_by_phandle(ssusb->dev, 0);
 		if (IS_ERR(otg_sx->edev)) {
 			dev_err(ssusb->dev, "couldn't get extcon device\n");
-			return -EPROBE_DEFER;
+			return PTR_ERR(otg_sx->edev);
 		}
 	}
 
@@ -445,8 +455,7 @@ static int mtu3_remove(struct platform_device *pdev)
  */
 static int __maybe_unused mtu3_suspend(struct device *dev)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct ssusb_mtk *ssusb = platform_get_drvdata(pdev);
+	struct ssusb_mtk *ssusb = dev_get_drvdata(dev);
 
 	dev_dbg(dev, "%s\n", __func__);
 
@@ -457,15 +466,14 @@ static int __maybe_unused mtu3_suspend(struct device *dev)
 	ssusb_host_disable(ssusb, true);
 	ssusb_phy_power_off(ssusb);
 	ssusb_clks_disable(ssusb);
-	ssusb_wakeup_enable(ssusb);
+	ssusb_wakeup_set(ssusb, true);
 
 	return 0;
 }
 
 static int __maybe_unused mtu3_resume(struct device *dev)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct ssusb_mtk *ssusb = platform_get_drvdata(pdev);
+	struct ssusb_mtk *ssusb = dev_get_drvdata(dev);
 	int ret;
 
 	dev_dbg(dev, "%s\n", __func__);
@@ -473,7 +481,7 @@ static int __maybe_unused mtu3_resume(struct device *dev)
 	if (!ssusb->is_host)
 		return 0;
 
-	ssusb_wakeup_disable(ssusb);
+	ssusb_wakeup_set(ssusb, false);
 	ret = ssusb_clks_enable(ssusb);
 	if (ret)
 		goto clks_err;

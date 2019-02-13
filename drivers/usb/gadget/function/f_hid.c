@@ -252,7 +252,7 @@ static ssize_t f_hidg_read(struct file *file, char __user *buffer,
 	if (!count)
 		return 0;
 
-	if (!access_ok(VERIFY_WRITE, buffer, count))
+	if (!access_ok(buffer, count))
 		return -EFAULT;
 
 	spin_lock_irqsave(&hidg->read_spinlock, flags);
@@ -339,7 +339,7 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 	unsigned long flags;
 	ssize_t status = -ENOMEM;
 
-	if (!access_ok(VERIFY_READ, buffer, count))
+	if (!access_ok(buffer, count))
 		return -EFAULT;
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
@@ -413,19 +413,19 @@ release_write_pending_unlocked:
 	return status;
 }
 
-static unsigned int f_hidg_poll(struct file *file, poll_table *wait)
+static __poll_t f_hidg_poll(struct file *file, poll_table *wait)
 {
 	struct f_hidg	*hidg  = file->private_data;
-	unsigned int	ret = 0;
+	__poll_t	ret = 0;
 
 	poll_wait(file, &hidg->read_queue, wait);
 	poll_wait(file, &hidg->write_queue, wait);
 
 	if (WRITE_COND)
-		ret |= POLLOUT | POLLWRNORM;
+		ret |= EPOLLOUT | EPOLLWRNORM;
 
 	if (READ_COND)
-		ret |= POLLIN | POLLRDNORM;
+		ret |= EPOLLIN | EPOLLRDNORM;
 
 	return ret;
 }

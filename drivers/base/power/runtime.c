@@ -8,6 +8,8 @@
  */
 
 #include <linux/sched/mm.h>
+#include <linux/ktime.h>
+#include <linux/hrtimer.h>
 #include <linux/export.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeirq.h>
@@ -93,7 +95,7 @@ static void __update_runtime_status(struct device *dev, enum rpm_status status)
 static void pm_runtime_deactivate_timer(struct device *dev)
 {
 	if (dev->power.timer_expires > 0) {
-		del_timer(&dev->power.suspend_timer);
+		hrtimer_cancel(&dev->power.suspend_timer);
 		dev->power.timer_expires = 0;
 	}
 }
@@ -119,17 +121,16 @@ static void pm_runtime_cancel_pending(struct device *dev)
  * Compute the autosuspend-delay expiration time based on the device's
  * power.last_busy time.  If the delay has already expired or is disabled
  * (negative) or the power.use_autosuspend flag isn't set, return 0.
- * Otherwise return the expiration time in jiffies (adjusted to be nonzero).
+ * Otherwise return the expiration time in nanoseconds (adjusted to be nonzero).
  *
  * This function may be called either with or without dev->power.lock held.
  * Either way it can be racy, since power.last_busy may be updated at any time.
  */
-unsigned long pm_runtime_autosuspend_expiration(struct device *dev)
+u64 pm_runtime_autosuspend_expiration(struct device *dev)
 {
 	int autosuspend_delay;
-	long elapsed;
-	unsigned long last_busy;
-	unsigned long expires = 0;
+	u64 last_busy, expires = 0;
+	u64 now = ktime_get_mono_fast_ns();
 
 	if (!dev->power.use_autosuspend)
 		goto out;
@@ -139,19 +140,9 @@ unsigned long pm_runtime_autosuspend_expiration(struct device *dev)
 		goto out;
 
 	last_busy = READ_ONCE(dev->power.last_busy);
-	elapsed = jiffies - last_busy;
-	if (elapsed < 0)
-		goto out;	/* jiffies has wrapped around. */
 
-	/*
-	 * If the autosuspend_delay is >= 1 second, align the timer by rounding
-	 * up to the nearest second.
-	 */
-	expires = last_busy + msecs_to_jiffies(autosuspend_delay);
-	if (autosuspend_delay >= 1000)
-		expires = round_jiffies(expires);
-	expires += !expires;
-	if (elapsed >= expires - last_busy)
+	expires = last_busy + (u64)autosuspend_delay * NSEC_PER_MSEC;
+	if (expires <= now)
 		expires = 0;	/* Already expired. */
 
  out:
@@ -276,7 +267,8 @@ static int rpm_get_suppliers(struct device *dev)
 			continue;
 
 		retval = pm_runtime_get_sync(link->supplier);
-		if (retval < 0) {
+		/* Ignore suppliers with disabled runtime PM. */
+		if (retval < 0 && retval != -EACCES) {
 			pm_runtime_put_noidle(link->supplier);
 			return retval;
 		}
@@ -514,7 +506,7 @@ static int rpm_suspend(struct device *dev, int rpmflags)
 	/* If the autosuspend_delay time hasn't expired yet, reschedule. */
 	if ((rpmflags & RPM_AUTO)
 	    && dev->power.runtime_status != RPM_SUSPENDING) {
-		unsigned long expires = pm_runtime_autosuspend_expiration(dev);
+		u64 expires = pm_runtime_autosuspend_expiration(dev);
 
 		if (expires != 0) {
 			/* Pending requests need to be canceled. */
@@ -527,10 +519,20 @@ static int rpm_suspend(struct device *dev, int rpmflags)
 			 * expire; pm_suspend_timer_fn() will take care of the
 			 * rest.
 			 */
-			if (!(dev->power.timer_expires && time_before_eq(
-			    dev->power.timer_expires, expires))) {
+			if (!(dev->power.timer_expires &&
+					dev->power.timer_expires <= expires)) {
+				/*
+				 * We add a slack of 25% to gather wakeups
+				 * without sacrificing the granularity.
+				 */
+				u64 slack = (u64)READ_ONCE(dev->power.autosuspend_delay) *
+						    (NSEC_PER_MSEC >> 2);
+
 				dev->power.timer_expires = expires;
-				mod_timer(&dev->power.suspend_timer, expires);
+				hrtimer_start_range_ns(&dev->power.suspend_timer,
+						ns_to_ktime(expires),
+						slack,
+						HRTIMER_MODE_ABS);
 			}
 			dev->power.timer_autosuspends = 1;
 			goto out;
@@ -894,23 +896,28 @@ static void pm_runtime_work(struct work_struct *work)
  *
  * Check if the time is right and queue a suspend request.
  */
-static void pm_suspend_timer_fn(struct timer_list *t)
+static enum hrtimer_restart  pm_suspend_timer_fn(struct hrtimer *timer)
 {
-	struct device *dev = from_timer(dev, t, power.suspend_timer);
+	struct device *dev = container_of(timer, struct device, power.suspend_timer);
 	unsigned long flags;
-	unsigned long expires;
+	u64 expires;
 
 	spin_lock_irqsave(&dev->power.lock, flags);
 
 	expires = dev->power.timer_expires;
-	/* If 'expire' is after 'jiffies' we've been called too early. */
-	if (expires > 0 && !time_after(expires, jiffies)) {
+	/*
+	 * If 'expires' is after the current time, we've been called
+	 * too early.
+	 */
+	if (expires > 0 && expires < ktime_get_mono_fast_ns()) {
 		dev->power.timer_expires = 0;
 		rpm_suspend(dev, dev->power.timer_autosuspends ?
 		    (RPM_ASYNC | RPM_AUTO) : RPM_ASYNC);
 	}
 
 	spin_unlock_irqrestore(&dev->power.lock, flags);
+
+	return HRTIMER_NORESTART;
 }
 
 /**
@@ -921,6 +928,7 @@ static void pm_suspend_timer_fn(struct timer_list *t)
 int pm_schedule_suspend(struct device *dev, unsigned int delay)
 {
 	unsigned long flags;
+	u64 expires;
 	int retval;
 
 	spin_lock_irqsave(&dev->power.lock, flags);
@@ -937,10 +945,10 @@ int pm_schedule_suspend(struct device *dev, unsigned int delay)
 	/* Other scheduled or pending requests need to be canceled. */
 	pm_runtime_cancel_pending(dev);
 
-	dev->power.timer_expires = jiffies + msecs_to_jiffies(delay);
-	dev->power.timer_expires += !dev->power.timer_expires;
+	expires = ktime_get_mono_fast_ns() + (u64)delay * NSEC_PER_MSEC;
+	dev->power.timer_expires = expires;
 	dev->power.timer_autosuspends = 0;
-	mod_timer(&dev->power.suspend_timer, dev->power.timer_expires);
+	hrtimer_start(&dev->power.suspend_timer, expires, HRTIMER_MODE_ABS);
 
  out:
 	spin_unlock_irqrestore(&dev->power.lock, flags);
@@ -1490,7 +1498,8 @@ void pm_runtime_init(struct device *dev)
 	INIT_WORK(&dev->power.work, pm_runtime_work);
 
 	dev->power.timer_expires = 0;
-	timer_setup(&dev->power.suspend_timer, pm_suspend_timer_fn, 0);
+	hrtimer_init(&dev->power.suspend_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	dev->power.suspend_timer.function = pm_suspend_timer_fn;
 
 	init_waitqueue_head(&dev->power.wait_queue);
 }
@@ -1606,10 +1615,19 @@ void pm_runtime_new_link(struct device *dev)
 
 void pm_runtime_drop_link(struct device *dev)
 {
+	rpm_put_suppliers(dev);
+
 	spin_lock_irq(&dev->power.lock);
 	WARN_ON(dev->power.links_count == 0);
 	dev->power.links_count--;
 	spin_unlock_irq(&dev->power.lock);
+}
+
+static bool pm_runtime_need_not_resume(struct device *dev)
+{
+	return atomic_read(&dev->power.usage_count) <= 1 &&
+		(atomic_read(&dev->power.child_count) == 0 ||
+		 dev->power.ignore_children);
 }
 
 /**
@@ -1617,17 +1635,22 @@ void pm_runtime_drop_link(struct device *dev)
  * @dev: Device to suspend.
  *
  * Disable runtime PM so we safely can check the device's runtime PM status and
- * if it is active, invoke it's .runtime_suspend callback to bring it into
- * suspend state. Keep runtime PM disabled to preserve the state unless we
- * encounter errors.
+ * if it is active, invoke its ->runtime_suspend callback to suspend it and
+ * change its runtime PM status field to RPM_SUSPENDED.  Also, if the device's
+ * usage and children counters don't indicate that the device was in use before
+ * the system-wide transition under way, decrement its parent's children counter
+ * (if there is a parent).  Keep runtime PM disabled to preserve the state
+ * unless we encounter errors.
  *
  * Typically this function may be invoked from a system suspend callback to make
- * sure the device is put into low power state.
+ * sure the device is put into low power state and it should only be used during
+ * system-wide PM transitions to sleep states.  It assumes that the analogous
+ * pm_runtime_force_resume() will be used to resume the device.
  */
 int pm_runtime_force_suspend(struct device *dev)
 {
 	int (*callback)(struct device *);
-	int ret = 0;
+	int ret;
 
 	pm_runtime_disable(dev);
 	if (pm_runtime_status_suspended(dev))
@@ -1635,27 +1658,23 @@ int pm_runtime_force_suspend(struct device *dev)
 
 	callback = RPM_GET_CALLBACK(dev, runtime_suspend);
 
-	if (!callback) {
-		ret = -ENOSYS;
-		goto err;
-	}
-
-	ret = callback(dev);
+	ret = callback ? callback(dev) : 0;
 	if (ret)
 		goto err;
 
 	/*
-	 * Increase the runtime PM usage count for the device's parent, in case
-	 * when we find the device being used when system suspend was invoked.
-	 * This informs pm_runtime_force_resume() to resume the parent
-	 * immediately, which is needed to be able to resume its children,
-	 * when not deferring the resume to be managed via runtime PM.
+	 * If the device can stay in suspend after the system-wide transition
+	 * to the working state that will follow, drop the children counter of
+	 * its parent, but set its status to RPM_SUSPENDED anyway in case this
+	 * function will be called again for it in the meantime.
 	 */
-	if (dev->parent && atomic_read(&dev->power.usage_count) > 1)
-		pm_runtime_get_noresume(dev->parent);
+	if (pm_runtime_need_not_resume(dev))
+		pm_runtime_set_suspended(dev);
+	else
+		__update_runtime_status(dev, RPM_SUSPENDED);
 
-	pm_runtime_set_suspended(dev);
 	return 0;
+
 err:
 	pm_runtime_enable(dev);
 	return ret;
@@ -1668,13 +1687,9 @@ EXPORT_SYMBOL_GPL(pm_runtime_force_suspend);
  *
  * Prior invoking this function we expect the user to have brought the device
  * into low power state by a call to pm_runtime_force_suspend(). Here we reverse
- * those actions and brings the device into full power, if it is expected to be
- * used on system resume. To distinguish that, we check whether the runtime PM
- * usage count is greater than 1 (the PM core increases the usage count in the
- * system PM prepare phase), as that indicates a real user (such as a subsystem,
- * driver, userspace, etc.) is using it. If that is the case, the device is
- * expected to be used on system resume as well, so then we resume it. In the
- * other case, we defer the resume to be managed via runtime PM.
+ * those actions and bring the device into full power, if it is expected to be
+ * used on system resume.  In the other case, we defer the resume to be managed
+ * via runtime PM.
  *
  * Typically this function may be invoked from a system resume callback.
  */
@@ -1683,32 +1698,18 @@ int pm_runtime_force_resume(struct device *dev)
 	int (*callback)(struct device *);
 	int ret = 0;
 
-	callback = RPM_GET_CALLBACK(dev, runtime_resume);
-
-	if (!callback) {
-		ret = -ENOSYS;
-		goto out;
-	}
-
-	if (!pm_runtime_status_suspended(dev))
+	if (!pm_runtime_status_suspended(dev) || pm_runtime_need_not_resume(dev))
 		goto out;
 
 	/*
-	 * Decrease the parent's runtime PM usage count, if we increased it
-	 * during system suspend in pm_runtime_force_suspend().
-	*/
-	if (atomic_read(&dev->power.usage_count) > 1) {
-		if (dev->parent)
-			pm_runtime_put_noidle(dev->parent);
-	} else {
-		goto out;
-	}
+	 * The value of the parent's children counter is correct already, so
+	 * just update the status of the device.
+	 */
+	__update_runtime_status(dev, RPM_ACTIVE);
 
-	ret = pm_runtime_set_active(dev);
-	if (ret)
-		goto out;
+	callback = RPM_GET_CALLBACK(dev, runtime_resume);
 
-	ret = callback(dev);
+	ret = callback ? callback(dev) : 0;
 	if (ret) {
 		pm_runtime_set_suspended(dev);
 		goto out;

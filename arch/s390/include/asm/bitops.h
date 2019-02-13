@@ -261,6 +261,11 @@ static inline void clear_bit_inv(unsigned long nr, volatile unsigned long *ptr)
 	return clear_bit(nr ^ (BITS_PER_LONG - 1), ptr);
 }
 
+static inline int test_and_clear_bit_inv(unsigned long nr, volatile unsigned long *ptr)
+{
+	return test_and_clear_bit(nr ^ (BITS_PER_LONG - 1), ptr);
+}
+
 static inline void __set_bit_inv(unsigned long nr, volatile unsigned long *ptr)
 {
 	return __set_bit(nr ^ (BITS_PER_LONG - 1), ptr);
@@ -392,9 +397,9 @@ static inline int fls64(unsigned long word)
  * This is defined the same way as ffs.
  * Note fls(0) = 0, fls(1) = 1, fls(0x80000000) = 32.
  */
-static inline int fls(int word)
+static inline int fls(unsigned int word)
 {
-	return fls64((unsigned int)word);
+	return fls64(word);
 }
 
 #else /* CONFIG_HAVE_MARCH_Z9_109_FEATURES */

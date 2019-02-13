@@ -1,4 +1,11 @@
-.. -*- coding: utf-8; mode: rst -*-
+.. Permission is granted to copy, distribute and/or modify this
+.. document under the terms of the GNU Free Documentation License,
+.. Version 1.1 or any later version published by the Free Software
+.. Foundation, with no Invariant Sections, no Front-Cover Texts
+.. and no Back-Cover Texts. A copy of the license is included at
+.. Documentation/media/uapi/fdl-appendix.rst.
+..
+.. TODO: replace it to GFDL-1.1-or-later WITH no-invariant-sections
 
 .. _VIDIOC_PREPARE_BUF:
 
@@ -34,7 +41,7 @@ Description
 
 Applications can optionally call the :ref:`VIDIOC_PREPARE_BUF` ioctl to
 pass ownership of the buffer to the driver before actually enqueuing it,
-using the :ref:`VIDIOC_QBUF` ioctl, and to prepare it for future I/O. Such
+using the :ref:`VIDIOC_QBUF <VIDIOC_QBUF>` ioctl, and to prepare it for future I/O. Such
 preparations may include cache invalidation or cleaning. Performing them
 in advance saves time during the actual I/O. In case such cache
 operations are not required, the application can use one of

@@ -46,11 +46,8 @@ static const char *phy_state_to_str(enum phy_state st)
 {
 	switch (st) {
 	PHY_STATE_STR(DOWN)
-	PHY_STATE_STR(STARTING)
 	PHY_STATE_STR(READY)
-	PHY_STATE_STR(PENDING)
 	PHY_STATE_STR(UP)
-	PHY_STATE_STR(AN)
 	PHY_STATE_STR(RUNNING)
 	PHY_STATE_STR(NOLINK)
 	PHY_STATE_STR(FORCING)
@@ -62,6 +59,17 @@ static const char *phy_state_to_str(enum phy_state st)
 	return NULL;
 }
 
+static void phy_link_up(struct phy_device *phydev)
+{
+	phydev->phy_link_change(phydev, true, true);
+	phy_led_trigger_change_speed(phydev);
+}
+
+static void phy_link_down(struct phy_device *phydev, bool do_carrier)
+{
+	phydev->phy_link_change(phydev, false, do_carrier);
+	phy_led_trigger_change_speed(phydev);
+}
 
 /**
  * phy_print_status - Convenience function to print out the current phy status
@@ -105,9 +113,9 @@ static int phy_clear_interrupt(struct phy_device *phydev)
  *
  * Returns 0 on success or < 0 on error.
  */
-static int phy_config_interrupt(struct phy_device *phydev, u32 interrupts)
+static int phy_config_interrupt(struct phy_device *phydev, bool interrupts)
 {
-	phydev->interrupts = interrupts;
+	phydev->interrupts = interrupts ? 1 : 0;
 	if (phydev->drv->config_intr)
 		return phydev->drv->config_intr(phydev);
 
@@ -171,11 +179,9 @@ EXPORT_SYMBOL(phy_aneg_done);
  * settings were found.
  */
 static const struct phy_setting *
-phy_find_valid(int speed, int duplex, u32 supported)
+phy_find_valid(int speed, int duplex, unsigned long *supported)
 {
-	unsigned long mask = supported;
-
-	return phy_lookup_setting(speed, duplex, &mask, BITS_PER_LONG, false);
+	return phy_lookup_setting(speed, duplex, supported, false);
 }
 
 /**
@@ -192,9 +198,7 @@ unsigned int phy_supported_speeds(struct phy_device *phy,
 				  unsigned int *speeds,
 				  unsigned int size)
 {
-	unsigned long supported = phy->supported;
-
-	return phy_speeds(speeds, size, &supported, BITS_PER_LONG);
+	return phy_speeds(speeds, size, phy->supported);
 }
 
 /**
@@ -206,11 +210,10 @@ unsigned int phy_supported_speeds(struct phy_device *phy,
  *
  * Description: Returns true if there is a valid setting, false otherwise.
  */
-static inline bool phy_check_valid(int speed, int duplex, u32 features)
+static inline bool phy_check_valid(int speed, int duplex,
+				   unsigned long *features)
 {
-	unsigned long mask = features;
-
-	return !!phy_lookup_setting(speed, duplex, &mask, BITS_PER_LONG, true);
+	return !!phy_lookup_setting(speed, duplex, features, true);
 }
 
 /**
@@ -224,13 +227,13 @@ static inline bool phy_check_valid(int speed, int duplex, u32 features)
 static void phy_sanitize_settings(struct phy_device *phydev)
 {
 	const struct phy_setting *setting;
-	u32 features = phydev->supported;
 
 	/* Sanitize settings based on PHY capabilities */
-	if ((features & SUPPORTED_Autoneg) == 0)
+	if (linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->supported))
 		phydev->autoneg = AUTONEG_DISABLE;
 
-	setting = phy_find_valid(phydev->speed, phydev->duplex, features);
+	setting = phy_find_valid(phydev->speed, phydev->duplex,
+				 phydev->supported);
 	if (setting) {
 		phydev->speed = setting->speed;
 		phydev->duplex = setting->duplex;
@@ -256,13 +259,15 @@ static void phy_sanitize_settings(struct phy_device *phydev)
  */
 int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd)
 {
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
 	u32 speed = ethtool_cmd_speed(cmd);
 
 	if (cmd->phy_address != phydev->mdio.addr)
 		return -EINVAL;
 
 	/* We make sure that we don't pass unsupported values in to the PHY */
-	cmd->advertising &= phydev->supported;
+	ethtool_convert_legacy_u32_to_link_mode(advertising, cmd->advertising);
+	linkmode_and(advertising, advertising, phydev->supported);
 
 	/* Verify the settings we care about. */
 	if (cmd->autoneg != AUTONEG_ENABLE && cmd->autoneg != AUTONEG_DISABLE)
@@ -283,12 +288,14 @@ int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd)
 
 	phydev->speed = speed;
 
-	phydev->advertising = cmd->advertising;
+	linkmode_copy(phydev->advertising, advertising);
 
 	if (AUTONEG_ENABLE == cmd->autoneg)
-		phydev->advertising |= ADVERTISED_Autoneg;
+		linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+				 phydev->advertising);
 	else
-		phydev->advertising &= ~ADVERTISED_Autoneg;
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+				   phydev->advertising);
 
 	phydev->duplex = cmd->duplex;
 
@@ -304,25 +311,24 @@ EXPORT_SYMBOL(phy_ethtool_sset);
 int phy_ethtool_ksettings_set(struct phy_device *phydev,
 			      const struct ethtool_link_ksettings *cmd)
 {
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
 	u8 autoneg = cmd->base.autoneg;
 	u8 duplex = cmd->base.duplex;
 	u32 speed = cmd->base.speed;
-	u32 advertising;
 
 	if (cmd->base.phy_address != phydev->mdio.addr)
 		return -EINVAL;
 
-	ethtool_convert_link_mode_to_legacy_u32(&advertising,
-						cmd->link_modes.advertising);
+	linkmode_copy(advertising, cmd->link_modes.advertising);
 
 	/* We make sure that we don't pass unsupported values in to the PHY */
-	advertising &= phydev->supported;
+	linkmode_and(advertising, advertising, phydev->supported);
 
 	/* Verify the settings we care about. */
 	if (autoneg != AUTONEG_ENABLE && autoneg != AUTONEG_DISABLE)
 		return -EINVAL;
 
-	if (autoneg == AUTONEG_ENABLE && advertising == 0)
+	if (autoneg == AUTONEG_ENABLE && linkmode_empty(advertising))
 		return -EINVAL;
 
 	if (autoneg == AUTONEG_DISABLE &&
@@ -337,12 +343,14 @@ int phy_ethtool_ksettings_set(struct phy_device *phydev,
 
 	phydev->speed = speed;
 
-	phydev->advertising = advertising;
+	linkmode_copy(phydev->advertising, advertising);
 
 	if (autoneg == AUTONEG_ENABLE)
-		phydev->advertising |= ADVERTISED_Autoneg;
+		linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+				 phydev->advertising);
 	else
-		phydev->advertising &= ~ADVERTISED_Autoneg;
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+				   phydev->advertising);
 
 	phydev->duplex = duplex;
 
@@ -358,14 +366,9 @@ EXPORT_SYMBOL(phy_ethtool_ksettings_set);
 void phy_ethtool_ksettings_get(struct phy_device *phydev,
 			       struct ethtool_link_ksettings *cmd)
 {
-	ethtool_convert_legacy_u32_to_link_mode(cmd->link_modes.supported,
-						phydev->supported);
-
-	ethtool_convert_legacy_u32_to_link_mode(cmd->link_modes.advertising,
-						phydev->advertising);
-
-	ethtool_convert_legacy_u32_to_link_mode(cmd->link_modes.lp_advertising,
-						phydev->lp_advertising);
+	linkmode_copy(cmd->link_modes.supported, phydev->supported);
+	linkmode_copy(cmd->link_modes.advertising, phydev->advertising);
+	linkmode_copy(cmd->link_modes.lp_advertising, phydev->lp_advertising);
 
 	cmd->base.speed = phydev->speed;
 	cmd->base.duplex = phydev->duplex;
@@ -434,7 +437,8 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 				}
 				break;
 			case MII_ADVERTISE:
-				phydev->advertising = mii_adv_to_ethtool_adv_t(val);
+				mii_adv_mod_linkmode_adv_t(phydev->advertising,
+							   val);
 				change_autoneg = true;
 				break;
 			default:
@@ -467,65 +471,58 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 }
 EXPORT_SYMBOL(phy_mii_ioctl);
 
-/**
- * phy_start_aneg_priv - start auto-negotiation for this PHY device
- * @phydev: the phy_device struct
- * @sync: indicate whether we should wait for the workqueue cancelation
- *
- * Description: Sanitizes the settings (if we're not autonegotiating
- *   them), and then calls the driver's config_aneg function.
- *   If the PHYCONTROL Layer is operating, we change the state to
- *   reflect the beginning of Auto-negotiation or forcing.
- */
-static int phy_start_aneg_priv(struct phy_device *phydev, bool sync)
+static void phy_queue_state_machine(struct phy_device *phydev,
+				    unsigned int secs)
 {
-	bool trigger = 0;
+	mod_delayed_work(system_power_efficient_wq, &phydev->state_queue,
+			 secs * HZ);
+}
+
+static void phy_trigger_machine(struct phy_device *phydev)
+{
+	phy_queue_state_machine(phydev, 0);
+}
+
+static int phy_config_aneg(struct phy_device *phydev)
+{
+	if (phydev->drv->config_aneg)
+		return phydev->drv->config_aneg(phydev);
+
+	/* Clause 45 PHYs that don't implement Clause 22 registers are not
+	 * allowed to call genphy_config_aneg()
+	 */
+	if (phydev->is_c45 && !(phydev->c45_ids.devices_in_package & BIT(0)))
+		return -EOPNOTSUPP;
+
+	return genphy_config_aneg(phydev);
+}
+
+/**
+ * phy_check_link_status - check link status and set state accordingly
+ * @phydev: the phy_device struct
+ *
+ * Description: Check for link and whether autoneg was triggered / is running
+ * and set state accordingly
+ */
+static int phy_check_link_status(struct phy_device *phydev)
+{
 	int err;
 
-	if (!phydev->drv)
-		return -EIO;
+	WARN_ON(!mutex_is_locked(&phydev->lock));
 
-	mutex_lock(&phydev->lock);
+	err = phy_read_status(phydev);
+	if (err)
+		return err;
 
-	if (AUTONEG_DISABLE == phydev->autoneg)
-		phy_sanitize_settings(phydev);
-
-	/* Invalidate LP advertising flags */
-	phydev->lp_advertising = 0;
-
-	err = phydev->drv->config_aneg(phydev);
-	if (err < 0)
-		goto out_unlock;
-
-	if (phydev->state != PHY_HALTED) {
-		if (AUTONEG_ENABLE == phydev->autoneg) {
-			phydev->state = PHY_AN;
-			phydev->link_timeout = PHY_AN_TIMEOUT;
-		} else {
-			phydev->state = PHY_FORCING;
-			phydev->link_timeout = PHY_FORCE_TIMEOUT;
-		}
+	if (phydev->link && phydev->state != PHY_RUNNING) {
+		phydev->state = PHY_RUNNING;
+		phy_link_up(phydev);
+	} else if (!phydev->link && phydev->state != PHY_NOLINK) {
+		phydev->state = PHY_NOLINK;
+		phy_link_down(phydev, true);
 	}
 
-	/* Re-schedule a PHY state machine to check PHY status because
-	 * negotiation may already be done and aneg interrupt may not be
-	 * generated.
-	 */
-	if (phy_interrupt_is_valid(phydev) && (phydev->state == PHY_AN)) {
-		err = phy_aneg_done(phydev);
-		if (err > 0) {
-			trigger = true;
-			err = 0;
-		}
-	}
-
-out_unlock:
-	mutex_unlock(&phydev->lock);
-
-	if (trigger)
-		phy_trigger_machine(phydev, sync);
-
-	return err;
+	return 0;
 }
 
 /**
@@ -539,9 +536,149 @@ out_unlock:
  */
 int phy_start_aneg(struct phy_device *phydev)
 {
-	return phy_start_aneg_priv(phydev, true);
+	int err;
+
+	if (!phydev->drv)
+		return -EIO;
+
+	mutex_lock(&phydev->lock);
+
+	if (AUTONEG_DISABLE == phydev->autoneg)
+		phy_sanitize_settings(phydev);
+
+	/* Invalidate LP advertising flags */
+	linkmode_zero(phydev->lp_advertising);
+
+	err = phy_config_aneg(phydev);
+	if (err < 0)
+		goto out_unlock;
+
+	if (__phy_is_started(phydev)) {
+		if (phydev->autoneg == AUTONEG_ENABLE) {
+			err = phy_check_link_status(phydev);
+		} else {
+			phydev->state = PHY_FORCING;
+			phydev->link_timeout = PHY_FORCE_TIMEOUT;
+		}
+	}
+
+out_unlock:
+	mutex_unlock(&phydev->lock);
+
+	return err;
 }
 EXPORT_SYMBOL(phy_start_aneg);
+
+static int phy_poll_aneg_done(struct phy_device *phydev)
+{
+	unsigned int retries = 100;
+	int ret;
+
+	do {
+		msleep(100);
+		ret = phy_aneg_done(phydev);
+	} while (!ret && --retries);
+
+	if (!ret)
+		return -ETIMEDOUT;
+
+	return ret < 0 ? ret : 0;
+}
+
+/**
+ * phy_speed_down - set speed to lowest speed supported by both link partners
+ * @phydev: the phy_device struct
+ * @sync: perform action synchronously
+ *
+ * Description: Typically used to save energy when waiting for a WoL packet
+ *
+ * WARNING: Setting sync to false may cause the system being unable to suspend
+ * in case the PHY generates an interrupt when finishing the autonegotiation.
+ * This interrupt may wake up the system immediately after suspend.
+ * Therefore use sync = false only if you're sure it's safe with the respective
+ * network chip.
+ */
+int phy_speed_down(struct phy_device *phydev, bool sync)
+{
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv);
+	int ret;
+
+	if (phydev->autoneg != AUTONEG_ENABLE)
+		return 0;
+
+	linkmode_copy(adv_old, phydev->advertising);
+	linkmode_copy(adv, phydev->lp_advertising);
+	linkmode_and(adv, adv, phydev->supported);
+
+	if (linkmode_test_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, adv) ||
+	    linkmode_test_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, adv)) {
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
+				   phydev->advertising);
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
+				   phydev->advertising);
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT,
+				   phydev->advertising);
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
+				   phydev->advertising);
+	} else if (linkmode_test_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
+				     adv) ||
+		   linkmode_test_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
+				     adv)) {
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT,
+				   phydev->advertising);
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
+				   phydev->advertising);
+	}
+
+	if (linkmode_equal(phydev->advertising, adv_old))
+		return 0;
+
+	ret = phy_config_aneg(phydev);
+	if (ret)
+		return ret;
+
+	return sync ? phy_poll_aneg_done(phydev) : 0;
+}
+EXPORT_SYMBOL_GPL(phy_speed_down);
+
+/**
+ * phy_speed_up - (re)set advertised speeds to all supported speeds
+ * @phydev: the phy_device struct
+ *
+ * Description: Used to revert the effect of phy_speed_down
+ */
+int phy_speed_up(struct phy_device *phydev)
+{
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(all_speeds) = { 0, };
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(not_speeds);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(speeds);
+
+	linkmode_copy(adv_old, phydev->advertising);
+
+	if (phydev->autoneg != AUTONEG_ENABLE)
+		return 0;
+
+	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, all_speeds);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, all_speeds);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT, all_speeds);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT, all_speeds);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT, all_speeds);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT, all_speeds);
+
+	linkmode_andnot(not_speeds, adv_old, all_speeds);
+	linkmode_copy(supported, phydev->supported);
+	linkmode_and(speeds, supported, all_speeds);
+	linkmode_or(phydev->advertising, not_speeds, speeds);
+
+	if (linkmode_equal(phydev->advertising, adv_old))
+		return 0;
+
+	return phy_config_aneg(phydev);
+}
+EXPORT_SYMBOL_GPL(phy_speed_up);
 
 /**
  * phy_start_machine - start PHY state machine tracking
@@ -555,28 +692,9 @@ EXPORT_SYMBOL(phy_start_aneg);
  */
 void phy_start_machine(struct phy_device *phydev)
 {
-	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue, HZ);
+	phy_trigger_machine(phydev);
 }
 EXPORT_SYMBOL_GPL(phy_start_machine);
-
-/**
- * phy_trigger_machine - trigger the state machine to run
- *
- * @phydev: the phy_device struct
- * @sync: indicate whether we should wait for the workqueue cancelation
- *
- * Description: There has been a change in state which requires that the
- *   state machine runs.
- */
-
-void phy_trigger_machine(struct phy_device *phydev, bool sync)
-{
-	if (sync)
-		cancel_delayed_work_sync(&phydev->state_queue);
-	else
-		cancel_delayed_work(&phydev->state_queue);
-	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue, 0);
-}
 
 /**
  * phy_stop_machine - stop the PHY state machine tracking
@@ -591,7 +709,7 @@ void phy_stop_machine(struct phy_device *phydev)
 	cancel_delayed_work_sync(&phydev->state_queue);
 
 	mutex_lock(&phydev->lock);
-	if (phydev->state > PHY_UP && phydev->state != PHY_HALTED)
+	if (__phy_is_started(phydev))
 		phydev->state = PHY_UP;
 	mutex_unlock(&phydev->lock);
 }
@@ -607,11 +725,30 @@ void phy_stop_machine(struct phy_device *phydev)
  */
 static void phy_error(struct phy_device *phydev)
 {
+	WARN_ON(1);
+
 	mutex_lock(&phydev->lock);
 	phydev->state = PHY_HALTED;
 	mutex_unlock(&phydev->lock);
 
-	phy_trigger_machine(phydev, false);
+	phy_trigger_machine(phydev);
+}
+
+/**
+ * phy_disable_interrupts - Disable the PHY interrupts from the PHY side
+ * @phydev: target phy_device struct
+ */
+static int phy_disable_interrupts(struct phy_device *phydev)
+{
+	int err;
+
+	/* Disable PHY interrupts */
+	err = phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+	if (err)
+		return err;
+
+	/* Clear the interrupt */
+	return phy_clear_interrupt(phydev);
 }
 
 /**
@@ -619,22 +756,28 @@ static void phy_error(struct phy_device *phydev)
  * @irq: interrupt line
  * @phy_dat: phy_device pointer
  *
- * Description: When a PHY interrupt occurs, the handler disables
- * interrupts, and uses phy_change to handle the interrupt.
+ * Description: Handle PHY interrupt
  */
 static irqreturn_t phy_interrupt(int irq, void *phy_dat)
 {
 	struct phy_device *phydev = phy_dat;
 
-	if (PHY_HALTED == phydev->state)
+	if (!phy_is_started(phydev))
 		return IRQ_NONE;		/* It can't be ours.  */
 
-	disable_irq_nosync(irq);
-	atomic_inc(&phydev->irq_disable);
+	if (phydev->drv->did_interrupt && !phydev->drv->did_interrupt(phydev))
+		return IRQ_NONE;
 
-	phy_change(phydev);
+	/* reschedule state queue work to run as soon as possible */
+	phy_trigger_machine(phydev);
 
+	if (phy_clear_interrupt(phydev))
+		goto phy_err;
 	return IRQ_HANDLED;
+
+phy_err:
+	phy_error(phydev);
+	return IRQ_NONE;
 }
 
 /**
@@ -652,32 +795,6 @@ static int phy_enable_interrupts(struct phy_device *phydev)
 }
 
 /**
- * phy_disable_interrupts - Disable the PHY interrupts from the PHY side
- * @phydev: target phy_device struct
- */
-static int phy_disable_interrupts(struct phy_device *phydev)
-{
-	int err;
-
-	/* Disable PHY interrupts */
-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
-	if (err)
-		goto phy_err;
-
-	/* Clear the interrupt */
-	err = phy_clear_interrupt(phydev);
-	if (err)
-		goto phy_err;
-
-	return 0;
-
-phy_err:
-	phy_error(phydev);
-
-	return err;
-}
-
-/**
  * phy_start_interrupts - request and enable interrupts for a PHY device
  * @phydev: target phy_device struct
  *
@@ -689,7 +806,6 @@ phy_err:
  */
 int phy_start_interrupts(struct phy_device *phydev)
 {
-	atomic_set(&phydev->irq_disable, 0);
 	if (request_threaded_irq(phydev->irq, NULL, phy_interrupt,
 				 IRQF_ONESHOT | IRQF_SHARED,
 				 phydev_name(phydev), phydev) < 0) {
@@ -716,74 +832,9 @@ int phy_stop_interrupts(struct phy_device *phydev)
 
 	free_irq(phydev->irq, phydev);
 
-	/* If work indeed has been cancelled, disable_irq() will have
-	 * been left unbalanced from phy_interrupt() and enable_irq()
-	 * has to be called so that other devices on the line work.
-	 */
-	while (atomic_dec_return(&phydev->irq_disable) >= 0)
-		enable_irq(phydev->irq);
-
 	return err;
 }
 EXPORT_SYMBOL(phy_stop_interrupts);
-
-/**
- * phy_change - Called by the phy_interrupt to handle PHY changes
- * @phydev: phy_device struct that interrupted
- */
-void phy_change(struct phy_device *phydev)
-{
-	if (phy_interrupt_is_valid(phydev)) {
-		if (phydev->drv->did_interrupt &&
-		    !phydev->drv->did_interrupt(phydev))
-			goto ignore;
-
-		if (phy_disable_interrupts(phydev))
-			goto phy_err;
-	}
-
-	mutex_lock(&phydev->lock);
-	if ((PHY_RUNNING == phydev->state) || (PHY_NOLINK == phydev->state))
-		phydev->state = PHY_CHANGELINK;
-	mutex_unlock(&phydev->lock);
-
-	if (phy_interrupt_is_valid(phydev)) {
-		atomic_dec(&phydev->irq_disable);
-		enable_irq(phydev->irq);
-
-		/* Reenable interrupts */
-		if (PHY_HALTED != phydev->state &&
-		    phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED))
-			goto irq_enable_err;
-	}
-
-	/* reschedule state queue work to run as soon as possible */
-	phy_trigger_machine(phydev, true);
-	return;
-
-ignore:
-	atomic_dec(&phydev->irq_disable);
-	enable_irq(phydev->irq);
-	return;
-
-irq_enable_err:
-	disable_irq(phydev->irq);
-	atomic_inc(&phydev->irq_disable);
-phy_err:
-	phy_error(phydev);
-}
-
-/**
- * phy_change_work - Scheduled by the phy_mac_interrupt to handle PHY changes
- * @work: work_struct that describes the work to be done
- */
-void phy_change_work(struct work_struct *work)
-{
-	struct phy_device *phydev =
-		container_of(work, struct phy_device, phy_queue);
-
-	phy_change(phydev);
-}
 
 /**
  * phy_stop - Bring down the PHY link, and stop checking the status
@@ -793,24 +844,24 @@ void phy_stop(struct phy_device *phydev)
 {
 	mutex_lock(&phydev->lock);
 
-	if (PHY_HALTED == phydev->state)
-		goto out_unlock;
-
-	if (phy_interrupt_is_valid(phydev)) {
-		/* Disable PHY Interrupts */
-		phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
-
-		/* Clear any pending interrupts */
-		phy_clear_interrupt(phydev);
+	if (!__phy_is_started(phydev)) {
+		WARN(1, "called from state %s\n",
+		     phy_state_to_str(phydev->state));
+		mutex_unlock(&phydev->lock);
+		return;
 	}
+
+	if (phy_interrupt_is_valid(phydev))
+		phy_disable_interrupts(phydev);
 
 	phydev->state = PHY_HALTED;
 
-out_unlock:
 	mutex_unlock(&phydev->lock);
 
+	phy_state_machine(&phydev->state_queue.work);
+
 	/* Cannot call flush_scheduled_work() here as desired because
-	 * of rtnl_lock(), but PHY_HALTED shall guarantee phy_change()
+	 * of rtnl_lock(), but PHY_HALTED shall guarantee irq handler
 	 * will not reenable interrupts.
 	 */
 }
@@ -828,53 +879,35 @@ EXPORT_SYMBOL(phy_stop);
  */
 void phy_start(struct phy_device *phydev)
 {
-	bool do_resume = false;
 	int err = 0;
 
 	mutex_lock(&phydev->lock);
 
 	switch (phydev->state) {
-	case PHY_STARTING:
-		phydev->state = PHY_PENDING;
-		break;
 	case PHY_READY:
 		phydev->state = PHY_UP;
 		break;
 	case PHY_HALTED:
+		/* if phy was suspended, bring the physical link up again */
+		__phy_resume(phydev);
+
 		/* make sure interrupts are re-enabled for the PHY */
-		if (phydev->irq != PHY_POLL) {
+		if (phy_interrupt_is_valid(phydev)) {
 			err = phy_enable_interrupts(phydev);
 			if (err < 0)
 				break;
 		}
 
 		phydev->state = PHY_RESUMING;
-		do_resume = true;
 		break;
 	default:
 		break;
 	}
 	mutex_unlock(&phydev->lock);
 
-	/* if phy was suspended, bring the physical link up again */
-	if (do_resume)
-		phy_resume(phydev);
-
-	phy_trigger_machine(phydev, true);
+	phy_trigger_machine(phydev);
 }
 EXPORT_SYMBOL(phy_start);
-
-static void phy_link_up(struct phy_device *phydev)
-{
-	phydev->phy_link_change(phydev, true, true);
-	phy_led_trigger_change_speed(phydev);
-}
-
-static void phy_link_down(struct phy_device *phydev, bool do_carrier)
-{
-	phydev->phy_link_change(phydev, false, do_carrier);
-	phy_led_trigger_change_speed(phydev);
-}
 
 /**
  * phy_state_machine - Handle the state machine
@@ -888,7 +921,6 @@ void phy_state_machine(struct work_struct *work)
 	bool needs_aneg = false, do_suspend = false;
 	enum phy_state old_state;
 	int err = 0;
-	int old_link;
 
 	mutex_lock(&phydev->lock);
 
@@ -899,63 +931,17 @@ void phy_state_machine(struct work_struct *work)
 
 	switch (phydev->state) {
 	case PHY_DOWN:
-	case PHY_STARTING:
 	case PHY_READY:
-	case PHY_PENDING:
 		break;
 	case PHY_UP:
 		needs_aneg = true;
 
-		phydev->link_timeout = PHY_AN_TIMEOUT;
-
-		break;
-	case PHY_AN:
-		err = phy_read_status(phydev);
-		if (err < 0)
-			break;
-
-		/* If the link is down, give up on negotiation for now */
-		if (!phydev->link) {
-			phydev->state = PHY_NOLINK;
-			phy_link_down(phydev, true);
-			break;
-		}
-
-		/* Check if negotiation is done.  Break if there's an error */
-		err = phy_aneg_done(phydev);
-		if (err < 0)
-			break;
-
-		/* If AN is done, we're running */
-		if (err > 0) {
-			phydev->state = PHY_RUNNING;
-			phy_link_up(phydev);
-		} else if (0 == phydev->link_timeout--)
-			needs_aneg = true;
 		break;
 	case PHY_NOLINK:
-		if (phy_interrupt_is_valid(phydev))
-			break;
-
-		err = phy_read_status(phydev);
-		if (err)
-			break;
-
-		if (phydev->link) {
-			if (AUTONEG_ENABLE == phydev->autoneg) {
-				err = phy_aneg_done(phydev);
-				if (err < 0)
-					break;
-
-				if (!err) {
-					phydev->state = PHY_AN;
-					phydev->link_timeout = PHY_AN_TIMEOUT;
-					break;
-				}
-			}
-			phydev->state = PHY_RUNNING;
-			phy_link_up(phydev);
-		}
+	case PHY_RUNNING:
+	case PHY_CHANGELINK:
+	case PHY_RESUMING:
+		err = phy_check_link_status(phydev);
 		break;
 	case PHY_FORCING:
 		err = genphy_update_link(phydev);
@@ -971,46 +957,6 @@ void phy_state_machine(struct work_struct *work)
 			phy_link_down(phydev, false);
 		}
 		break;
-	case PHY_RUNNING:
-		/* Only register a CHANGE if we are polling and link changed
-		 * since latest checking.
-		 */
-		if (phydev->irq == PHY_POLL) {
-			old_link = phydev->link;
-			err = phy_read_status(phydev);
-			if (err)
-				break;
-
-			if (old_link != phydev->link)
-				phydev->state = PHY_CHANGELINK;
-		}
-		/*
-		 * Failsafe: check that nobody set phydev->link=0 between two
-		 * poll cycles, otherwise we won't leave RUNNING state as long
-		 * as link remains down.
-		 */
-		if (!phydev->link && phydev->state == PHY_RUNNING) {
-			phydev->state = PHY_CHANGELINK;
-			phydev_err(phydev, "no link in PHY_RUNNING\n");
-		}
-		break;
-	case PHY_CHANGELINK:
-		err = phy_read_status(phydev);
-		if (err)
-			break;
-
-		if (phydev->link) {
-			phydev->state = PHY_RUNNING;
-			phy_link_up(phydev);
-		} else {
-			phydev->state = PHY_NOLINK;
-			phy_link_down(phydev, true);
-		}
-
-		if (phy_interrupt_is_valid(phydev))
-			err = phy_config_interrupt(phydev,
-						   PHY_INTERRUPT_ENABLED);
-		break;
 	case PHY_HALTED:
 		if (phydev->link) {
 			phydev->link = 0;
@@ -1018,51 +964,12 @@ void phy_state_machine(struct work_struct *work)
 			do_suspend = true;
 		}
 		break;
-	case PHY_RESUMING:
-		if (AUTONEG_ENABLE == phydev->autoneg) {
-			err = phy_aneg_done(phydev);
-			if (err < 0)
-				break;
-
-			/* err > 0 if AN is done.
-			 * Otherwise, it's 0, and we're  still waiting for AN
-			 */
-			if (err > 0) {
-				err = phy_read_status(phydev);
-				if (err)
-					break;
-
-				if (phydev->link) {
-					phydev->state = PHY_RUNNING;
-					phy_link_up(phydev);
-				} else	{
-					phydev->state = PHY_NOLINK;
-					phy_link_down(phydev, false);
-				}
-			} else {
-				phydev->state = PHY_AN;
-				phydev->link_timeout = PHY_AN_TIMEOUT;
-			}
-		} else {
-			err = phy_read_status(phydev);
-			if (err)
-				break;
-
-			if (phydev->link) {
-				phydev->state = PHY_RUNNING;
-				phy_link_up(phydev);
-			} else	{
-				phydev->state = PHY_NOLINK;
-				phy_link_down(phydev, false);
-			}
-		}
-		break;
 	}
 
 	mutex_unlock(&phydev->lock);
 
 	if (needs_aneg)
-		err = phy_start_aneg_priv(phydev, false);
+		err = phy_start_aneg(phydev);
 	else if (do_suspend)
 		phy_suspend(phydev);
 
@@ -1076,30 +983,53 @@ void phy_state_machine(struct work_struct *work)
 
 	/* Only re-schedule a PHY state machine change if we are polling the
 	 * PHY, if PHY_IGNORE_INTERRUPT is set, then we will be moving
-	 * between states from phy_mac_interrupt()
+	 * between states from phy_mac_interrupt().
+	 *
+	 * In state PHY_HALTED the PHY gets suspended, so rescheduling the
+	 * state machine would be pointless and possibly error prone when
+	 * called from phy_disconnect() synchronously.
 	 */
-	if (phydev->irq == PHY_POLL)
-		queue_delayed_work(system_power_efficient_wq, &phydev->state_queue,
-				   PHY_STATE_TIME * HZ);
+	if (phy_polling_mode(phydev) && phy_is_started(phydev))
+		phy_queue_state_machine(phydev, PHY_STATE_TIME);
 }
 
 /**
  * phy_mac_interrupt - MAC says the link has changed
  * @phydev: phy_device struct with changed link
- * @new_link: Link is Up/Down.
  *
- * Description: The MAC layer is able indicate there has been a change
- *   in the PHY link status. Set the new link status, and trigger the
- *   state machine, work a work queue.
+ * The MAC layer is able to indicate there has been a change in the PHY link
+ * status. Trigger the state machine and work a work queue.
  */
-void phy_mac_interrupt(struct phy_device *phydev, int new_link)
+void phy_mac_interrupt(struct phy_device *phydev)
 {
-	phydev->link = new_link;
-
 	/* Trigger a state machine change */
-	queue_work(system_power_efficient_wq, &phydev->phy_queue);
+	phy_trigger_machine(phydev);
 }
 EXPORT_SYMBOL(phy_mac_interrupt);
+
+static void mmd_eee_adv_to_linkmode(unsigned long *advertising, u16 eee_adv)
+{
+	linkmode_zero(advertising);
+
+	if (eee_adv & MDIO_EEE_100TX)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
+				 advertising);
+	if (eee_adv & MDIO_EEE_1000T)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
+				 advertising);
+	if (eee_adv & MDIO_EEE_10GT)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
+				 advertising);
+	if (eee_adv & MDIO_EEE_1000KX)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseKX_Full_BIT,
+				 advertising);
+	if (eee_adv & MDIO_EEE_10GKX4)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseKX4_Full_BIT,
+				 advertising);
+	if (eee_adv & MDIO_EEE_10GKR)
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseKR_Full_BIT,
+				 advertising);
+}
 
 /**
  * phy_init_eee - init and check the EEE feature
@@ -1119,9 +1049,12 @@ int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 	/* According to 802.3az,the EEE is supported only in full duplex-mode.
 	 */
 	if (phydev->duplex == DUPLEX_FULL) {
+		__ETHTOOL_DECLARE_LINK_MODE_MASK(common);
+		__ETHTOOL_DECLARE_LINK_MODE_MASK(lp);
+		__ETHTOOL_DECLARE_LINK_MODE_MASK(adv);
 		int eee_lp, eee_cap, eee_adv;
-		u32 lp, cap, adv;
 		int status;
+		u32 cap;
 
 		/* Read phy status to properly get the right settings */
 		status = phy_read_status(phydev);
@@ -1148,9 +1081,11 @@ int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 		if (eee_adv <= 0)
 			goto eee_exit_err;
 
-		adv = mmd_eee_adv_to_ethtool_adv_t(eee_adv);
-		lp = mmd_eee_adv_to_ethtool_adv_t(eee_lp);
-		if (!phy_check_valid(phydev->speed, phydev->duplex, lp & adv))
+		mmd_eee_adv_to_linkmode(adv, eee_adv);
+		mmd_eee_adv_to_linkmode(lp, eee_lp);
+		linkmode_and(common, adv, lp);
+
+		if (!phy_check_valid(phydev->speed, phydev->duplex, common))
 			goto eee_exit_err;
 
 		if (clk_stop_enable) {
@@ -1214,12 +1149,15 @@ int phy_ethtool_get_eee(struct phy_device *phydev, struct ethtool_eee *data)
 	if (val < 0)
 		return val;
 	data->advertised = mmd_eee_adv_to_ethtool_adv_t(val);
+	data->eee_enabled = !!data->advertised;
 
 	/* Get LP advertisement EEE */
 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
 	if (val < 0)
 		return val;
 	data->lp_advertised = mmd_eee_adv_to_ethtool_adv_t(val);
+
+	data->eee_active = !!(data->advertised & data->lp_advertised);
 
 	return 0;
 }
@@ -1234,7 +1172,7 @@ EXPORT_SYMBOL(phy_ethtool_get_eee);
  */
 int phy_ethtool_set_eee(struct phy_device *phydev, struct ethtool_eee *data)
 {
-	int cap, old_adv, adv, ret;
+	int cap, old_adv, adv = 0, ret;
 
 	if (!phydev->drv)
 		return -EIO;
@@ -1248,10 +1186,12 @@ int phy_ethtool_set_eee(struct phy_device *phydev, struct ethtool_eee *data)
 	if (old_adv < 0)
 		return old_adv;
 
-	adv = ethtool_adv_to_mmd_eee_adv_t(data->advertised) & cap;
-
-	/* Mask prohibited EEE modes */
-	adv &= ~phydev->eee_broken_modes;
+	if (data->eee_enabled) {
+		adv = !data->advertised ? cap :
+		      ethtool_adv_to_mmd_eee_adv_t(data->advertised) & cap;
+		/* Mask prohibited EEE modes */
+		adv &= ~phydev->eee_broken_modes;
+	}
 
 	if (old_adv != adv) {
 		ret = phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, adv);

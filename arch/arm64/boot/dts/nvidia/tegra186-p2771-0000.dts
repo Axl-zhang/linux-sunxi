@@ -2,6 +2,7 @@
 /dts-v1/;
 
 #include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/input/gpio-keys.h>
 
 #include "tegra186-p3310.dtsi"
 
@@ -50,6 +51,10 @@
 		vmmc-supply = <&vdd_sd>;
 	};
 
+	hda@3510000 {
+		status = "okay";
+	};
+
 	pcie@10003000 {
 		status = "okay";
 
@@ -74,6 +79,43 @@
 		};
 	};
 
+	host1x@13e00000 {
+		status = "okay";
+
+		dpaux@15040000 {
+			status = "okay";
+		};
+
+		display-hub@15200000 {
+			status = "okay";
+		};
+
+		dsi@15300000 {
+			status = "disabled";
+		};
+
+		sor@15540000 {
+			status = "disabled";
+
+			nvidia,dpaux = <&dpaux1>;
+		};
+
+		sor@15580000 {
+			status = "okay";
+
+			avdd-io-supply = <&vdd_hdmi_1v05>;
+			vdd-pll-supply = <&vdd_1v8_ap>;
+			hdmi-supply = <&vdd_hdmi>;
+
+			nvidia,ddc-i2c-bus = <&ddc>;
+			nvidia,hpd-gpio = <&gpio TEGRA_MAIN_GPIO(P, 1) GPIO_ACTIVE_LOW>;
+		};
+
+		dpaux@155c0000 {
+			status = "okay";
+		};
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -84,6 +126,7 @@
 			linux,input-type = <EV_KEY>;
 			linux,code = <KEY_POWER>;
 			debounce-interval = <10>;
+			wakeup-event-action = <EV_ACT_ASSERTED>;
 			wakeup-source;
 		};
 
@@ -119,6 +162,20 @@
 			enable-active-high;
 
 			vin-supply = <&vdd_3v3_sys>;
+		};
+
+		vdd_hdmi: regulator@101 {
+			compatible = "regulator-fixed";
+			reg = <101>;
+
+			regulator-name = "VDD_HDMI_5V0";
+			regulator-min-microvolt = <5000000>;
+			regulator-max-microvolt = <5000000>;
+
+			gpio = <&exp1 14 GPIO_ACTIVE_HIGH>;
+			enable-active-high;
+
+			vin-supply = <&vdd_5v0_sys>;
 		};
 	};
 };

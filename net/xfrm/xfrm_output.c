@@ -44,7 +44,7 @@ static int xfrm_skb_check_space(struct sk_buff *skb)
 
 static struct dst_entry *skb_dst_pop(struct sk_buff *skb)
 {
-	struct dst_entry *child = dst_clone(skb_dst(skb)->child);
+	struct dst_entry *child = dst_clone(xfrm_dst_child(skb_dst(skb)));
 
 	skb_dst_drop(skb);
 	return child;
@@ -66,8 +66,7 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
 			goto error_nolock;
 		}
 
-		if (x->props.output_mark)
-			skb->mark = x->props.output_mark;
+		skb->mark = xfrm_smark_get(skb->mark, x);
 
 		err = x->outer_mode->output(x, skb);
 		if (err) {
@@ -101,6 +100,11 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
 		spin_unlock_bh(&x->lock);
 
 		skb_dst_force(skb);
+		if (!skb_dst(skb)) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+			err = -EHOSTUNREACH;
+			goto error_nolock;
+		}
 
 		if (xfrm_offload(skb)) {
 			x->type_offload->encap(x, skb);
@@ -190,7 +194,7 @@ static int xfrm_output_gso(struct net *net, struct sock *sk, struct sk_buff *skb
 		struct sk_buff *nskb = segs->next;
 		int err;
 
-		segs->next = NULL;
+		skb_mark_not_on_list(segs);
 		err = xfrm_output2(net, sk, segs);
 
 		if (unlikely(err)) {
@@ -215,19 +219,16 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
 	if (xfrm_dev_offload_ok(skb, x)) {
 		struct sec_path *sp;
 
-		sp = secpath_dup(skb->sp);
+		sp = secpath_set(skb);
 		if (!sp) {
 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
 			kfree_skb(skb);
 			return -ENOMEM;
 		}
-		if (skb->sp)
-			secpath_put(skb->sp);
-		skb->sp = sp;
 		skb->encapsulation = 1;
 
 		sp->olen++;
-		sp->xvec[skb->sp->len++] = x;
+		sp->xvec[sp->len++] = x;
 		xfrm_state_hold(x);
 
 		if (skb_is_gso(skb)) {
@@ -285,8 +286,9 @@ void xfrm_local_error(struct sk_buff *skb, int mtu)
 		return;
 
 	afinfo = xfrm_state_get_afinfo(proto);
-	if (afinfo)
+	if (afinfo) {
 		afinfo->local_error(skb, mtu);
-	rcu_read_unlock();
+		rcu_read_unlock();
+	}
 }
 EXPORT_SYMBOL_GPL(xfrm_local_error);

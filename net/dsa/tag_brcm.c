@@ -70,6 +70,18 @@ static struct sk_buff *brcm_tag_xmit_ll(struct sk_buff *skb,
 	if (skb_cow_head(skb, BRCM_TAG_LEN) < 0)
 		return NULL;
 
+	/* The Ethernet switch we are interfaced with needs packets to be at
+	 * least 64 bytes (including FCS) otherwise they will be discarded when
+	 * they enter the switch port logic. When Broadcom tags are enabled, we
+	 * need to make sure that packets are at least 68 bytes
+	 * (including FCS and tag) because the length verification is done after
+	 * the Broadcom tag is stripped off the ingress packet.
+	 *
+	 * Let dsa_slave_xmit() free the SKB
+	 */
+	if (__skb_put_padto(skb, ETH_ZLEN + BRCM_TAG_LEN, false))
+		return NULL;
+
 	skb_push(skb, BRCM_TAG_LEN);
 
 	if (offset)
@@ -162,6 +174,7 @@ static struct sk_buff *brcm_tag_rcv(struct sk_buff *skb, struct net_device *dev,
 const struct dsa_device_ops brcm_netdev_ops = {
 	.xmit	= brcm_tag_xmit,
 	.rcv	= brcm_tag_rcv,
+	.overhead = BRCM_TAG_LEN,
 };
 #endif
 
@@ -184,5 +197,6 @@ static struct sk_buff *brcm_tag_rcv_prepend(struct sk_buff *skb,
 const struct dsa_device_ops brcm_prepend_netdev_ops = {
 	.xmit	= brcm_tag_xmit_prepend,
 	.rcv	= brcm_tag_rcv_prepend,
+	.overhead = BRCM_TAG_LEN,
 };
 #endif

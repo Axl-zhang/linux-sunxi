@@ -11,7 +11,6 @@
 #include <linux/errno.h>
 #include <linux/swap.h>
 #include <linux/init.h>
-#include <linux/bootmem.h>
 #include <linux/mman.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
@@ -36,6 +35,7 @@
 #include <asm/system_info.h>
 #include <asm/tlb.h>
 #include <asm/fixmap.h>
+#include <asm/ptdump.h>
 
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
@@ -50,26 +50,7 @@ unsigned long __init __clear_cr(unsigned long mask)
 }
 #endif
 
-static phys_addr_t phys_initrd_start __initdata = 0;
-static unsigned long phys_initrd_size __initdata = 0;
-
-static int __init early_initrd(char *p)
-{
-	phys_addr_t start;
-	unsigned long size;
-	char *endp;
-
-	start = memparse(p, &endp);
-	if (*endp == ',') {
-		size = memparse(endp + 1, NULL);
-
-		phys_initrd_start = start;
-		phys_initrd_size = size;
-	}
-	return 0;
-}
-early_param("initrd", early_initrd);
-
+#ifdef CONFIG_BLK_DEV_INITRD
 static int __init parse_tag_initrd(const struct tag *tag)
 {
 	pr_warn("ATAG_INITRD is deprecated; "
@@ -89,6 +70,7 @@ static int __init parse_tag_initrd2(const struct tag *tag)
 }
 
 __tagtable(ATAG_INITRD2, parse_tag_initrd2);
+#endif
 
 static void __init find_limits(unsigned long *min, unsigned long *max_low,
 			       unsigned long *max_high)
@@ -235,12 +217,6 @@ static void __init arm_initrd_init(void)
 #ifdef CONFIG_BLK_DEV_INITRD
 	phys_addr_t start;
 	unsigned long size;
-
-	/* FDT scan will populate initrd_start */
-	if (initrd_start && !phys_initrd_size) {
-		phys_initrd_start = __virt_to_phys(initrd_start);
-		phys_initrd_size = initrd_end - initrd_start;
-	}
 
 	initrd_start = initrd_end = 0;
 
@@ -507,7 +483,7 @@ void __init mem_init(void)
 
 	/* this will put all unused low memory onto the freelists */
 	free_unused_memmap();
-	free_all_bootmem();
+	memblock_free_all();
 
 #ifdef CONFIG_SA1111
 	/* now that our DMA memory is actually so designated, we can free it */
@@ -735,19 +711,29 @@ static int __mark_rodata_ro(void *unused)
 	return 0;
 }
 
+static int kernel_set_to_readonly __read_mostly;
+
 void mark_rodata_ro(void)
 {
+	kernel_set_to_readonly = 1;
 	stop_machine(__mark_rodata_ro, NULL, NULL);
+	debug_checkwx();
 }
 
 void set_kernel_text_rw(void)
 {
+	if (!kernel_set_to_readonly)
+		return;
+
 	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), false,
 				current->active_mm);
 }
 
 void set_kernel_text_ro(void)
 {
+	if (!kernel_set_to_readonly)
+		return;
+
 	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), true,
 				current->active_mm);
 }
@@ -756,20 +742,9 @@ void set_kernel_text_ro(void)
 static inline void fix_kernmem_perms(void) { }
 #endif /* CONFIG_STRICT_KERNEL_RWX */
 
-void free_tcmmem(void)
-{
-#ifdef CONFIG_HAVE_TCM
-	extern char __tcm_start, __tcm_end;
-
-	poison_init_mem(&__tcm_start, &__tcm_end - &__tcm_start);
-	free_reserved_area(&__tcm_start, &__tcm_end, -1, "TCM link");
-#endif
-}
-
 void free_initmem(void)
 {
 	fix_kernmem_perms();
-	free_tcmmem();
 
 	poison_init_mem(__init_begin, __init_end - __init_begin);
 	if (!machine_is_integrator() && !machine_is_cintegrator())

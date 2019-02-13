@@ -471,6 +471,12 @@ struct mlx5_core_qp {
 	int			qpn;
 	struct mlx5_rsc_debug	*dbg;
 	int			pid;
+	u16			uid;
+};
+
+struct mlx5_core_dct {
+	struct mlx5_core_qp	mqp;
+	struct completion	drained;
 };
 
 struct mlx5_qp_path {
@@ -549,6 +555,9 @@ static inline struct mlx5_core_mkey *__mlx5_mr_lookup(struct mlx5_core_dev *dev,
 	return radix_tree_lookup(&dev->priv.mkey_table.tree, key);
 }
 
+int mlx5_core_create_dct(struct mlx5_core_dev *dev,
+			 struct mlx5_core_dct *qp,
+			 u32 *in, int inlen);
 int mlx5_core_create_qp(struct mlx5_core_dev *dev,
 			struct mlx5_core_qp *qp,
 			u32 *in,
@@ -558,8 +567,12 @@ int mlx5_core_qp_modify(struct mlx5_core_dev *dev, u16 opcode,
 			struct mlx5_core_qp *qp);
 int mlx5_core_destroy_qp(struct mlx5_core_dev *dev,
 			 struct mlx5_core_qp *qp);
+int mlx5_core_destroy_dct(struct mlx5_core_dev *dev,
+			  struct mlx5_core_dct *dct);
 int mlx5_core_qp_query(struct mlx5_core_dev *dev, struct mlx5_core_qp *qp,
 		       u32 *out, int outlen);
+int mlx5_core_dct_query(struct mlx5_core_dev *dev, struct mlx5_core_dct *dct,
+			u32 *out, int outlen);
 
 int mlx5_core_set_delay_drop(struct mlx5_core_dev *dev,
 			     u32 timeout_usec);
@@ -582,6 +595,11 @@ int mlx5_core_alloc_q_counter(struct mlx5_core_dev *dev, u16 *counter_id);
 int mlx5_core_dealloc_q_counter(struct mlx5_core_dev *dev, u16 counter_id);
 int mlx5_core_query_q_counter(struct mlx5_core_dev *dev, u16 counter_id,
 			      int reset, void *out, int out_size);
+
+struct mlx5_core_rsc_common *mlx5_core_res_hold(struct mlx5_core_dev *dev,
+						int res_num,
+						enum mlx5_res_type res_type);
+void mlx5_core_res_put(struct mlx5_core_rsc_common *res);
 
 static inline const char *mlx5_qp_type_str(int type)
 {

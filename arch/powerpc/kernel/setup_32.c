@@ -39,6 +39,11 @@
 #include <asm/udbg.h>
 #include <asm/code-patching.h>
 #include <asm/cpu_has_feature.h>
+#include <asm/asm-prototypes.h>
+#include <asm/kdump.h>
+#include <asm/feature-fixups.h>
+
+#include "setup.h"
 
 #define DBG(fmt...)
 
@@ -54,7 +59,6 @@ unsigned long ISA_DMA_THRESHOLD;
 unsigned int DMA_MODE_READ;
 unsigned int DMA_MODE_WRITE;
 
-EXPORT_SYMBOL(ISA_DMA_THRESHOLD);
 EXPORT_SYMBOL(DMA_MODE_READ);
 EXPORT_SYMBOL(DMA_MODE_WRITE);
 
@@ -94,11 +98,9 @@ notrace unsigned long __init early_init(unsigned long dt_ptr)
  * We do the initial parsing of the flat device-tree and prepares
  * for the MMU to be fully initialized.
  */
-extern unsigned int memset_nocache_branch; /* Insn to be replaced by NOP */
-
 notrace void __init machine_init(u64 dt_ptr)
 {
-	unsigned int *addr = &memset_nocache_branch;
+	unsigned int *addr = (unsigned int *)patch_site_addr(&patch__memset_nocache);
 	unsigned long insn;
 
 	/* Configure static keys first, now that we're relocated. */
@@ -107,7 +109,7 @@ notrace void __init machine_init(u64 dt_ptr)
 	/* Enable early debugging if any specified (see udbg.h) */
 	udbg_early_init();
 
-	patch_instruction((unsigned int *)&memcpy, PPC_INST_NOP);
+	patch_instruction_site(&patch__memcpy_nocache, PPC_INST_NOP);
 
 	insn = create_cond_branch(addr, branch_target(addr), 0x820000);
 	patch_instruction(addr, insn);	/* replace b by bne cr0 */
@@ -121,7 +123,7 @@ notrace void __init machine_init(u64 dt_ptr)
 }
 
 /* Checks "l2cr=xxxx" command-line option */
-int __init ppc_setup_l2cr(char *str)
+static int __init ppc_setup_l2cr(char *str)
 {
 	if (cpu_has_feature(CPU_FTR_L2CR)) {
 		unsigned long val = simple_strtoul(str, NULL, 0);
@@ -134,7 +136,7 @@ int __init ppc_setup_l2cr(char *str)
 __setup("l2cr=", ppc_setup_l2cr);
 
 /* Checks "l3cr=xxxx" command-line option */
-int __init ppc_setup_l3cr(char *str)
+static int __init ppc_setup_l3cr(char *str)
 {
 	if (cpu_has_feature(CPU_FTR_L3CR)) {
 		unsigned long val = simple_strtoul(str, NULL, 0);
@@ -180,7 +182,7 @@ EXPORT_SYMBOL(nvram_sync);
 
 #endif /* CONFIG_NVRAM */
 
-int __init ppc_init(void)
+static int __init ppc_init(void)
 {
 	/* clear the progress line */
 	if (ppc_md.progress)
@@ -192,7 +194,6 @@ int __init ppc_init(void)
 	}
 	return 0;
 }
-
 arch_initcall(ppc_init);
 
 void __init irqstack_early_init(void)
@@ -203,9 +204,9 @@ void __init irqstack_early_init(void)
 	 * as the memblock is limited to lowmem by default */
 	for_each_possible_cpu(i) {
 		softirq_ctx[i] = (struct thread_info *)
-			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_phys_alloc(THREAD_SIZE, THREAD_SIZE));
 		hardirq_ctx[i] = (struct thread_info *)
-			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_phys_alloc(THREAD_SIZE, THREAD_SIZE));
 	}
 }
 
@@ -224,12 +225,12 @@ void __init exc_lvl_early_init(void)
 #endif
 
 		critirq_ctx[hw_cpu] = (struct thread_info *)
-			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_phys_alloc(THREAD_SIZE, THREAD_SIZE));
 #ifdef CONFIG_BOOKE
 		dbgirq_ctx[hw_cpu] = (struct thread_info *)
-			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_phys_alloc(THREAD_SIZE, THREAD_SIZE));
 		mcheckirq_ctx[hw_cpu] = (struct thread_info *)
-			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_phys_alloc(THREAD_SIZE, THREAD_SIZE));
 #endif
 	}
 }
@@ -237,7 +238,7 @@ void __init exc_lvl_early_init(void)
 
 void __init setup_power_save(void)
 {
-#ifdef CONFIG_6xx
+#ifdef CONFIG_PPC_BOOK3S_32
 	if (cpu_has_feature(CPU_FTR_CAN_DOZE) ||
 	    cpu_has_feature(CPU_FTR_CAN_NAP))
 		ppc_md.power_save = ppc6xx_idle;

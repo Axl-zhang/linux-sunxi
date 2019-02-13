@@ -3732,19 +3732,7 @@ static int skge_debug_show(struct seq_file *seq, void *v)
 
 	return 0;
 }
-
-static int skge_debug_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, skge_debug_show, inode->i_private);
-}
-
-static const struct file_operations skge_debug_fops = {
-	.owner		= THIS_MODULE,
-	.open		= skge_debug_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
+DEFINE_SHOW_ATTRIBUTE(skge_debug);
 
 /*
  * Use network device events to create/remove/rename
@@ -3783,7 +3771,7 @@ static int skge_device_event(struct notifier_block *unused,
 		break;
 
 	case NETDEV_UP:
-		d = debugfs_create_file(dev->name, S_IRUGO,
+		d = debugfs_create_file(dev->name, 0444,
 					skge_debug, dev,
 					&skge_debug_fops);
 		if (!d || IS_ERR(d))
@@ -4081,7 +4069,6 @@ static void skge_remove(struct pci_dev *pdev)
 	if (hw->ports > 1) {
 		skge_write32(hw, B0_IMSK, 0);
 		skge_read32(hw, B0_IMSK);
-		free_irq(pdev->irq, hw);
 	}
 	spin_unlock_irq(&hw->hw_lock);
 

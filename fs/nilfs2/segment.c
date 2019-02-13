@@ -1,17 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * segment.c - NILFS segment constructor.
  *
  * Copyright (C) 2005-2008 Nippon Telegraph and Telephone Corporation.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  *
  * Written by Ryusuke Konishi.
  *
@@ -1979,7 +1970,7 @@ static void nilfs_segctor_drop_written_files(struct nilfs_sc_info *sci,
 					     struct the_nilfs *nilfs)
 {
 	struct nilfs_inode_info *ii, *n;
-	int during_mount = !(sci->sc_super->s_flags & MS_ACTIVE);
+	int during_mount = !(sci->sc_super->s_flags & SB_ACTIVE);
 	int defer_iput = false;
 
 	spin_lock(&nilfs->ns_inode_lock);
@@ -2040,7 +2031,7 @@ static int nilfs_segctor_do_construct(struct nilfs_sc_info *sci, int mode)
 			goto out;
 
 		/* Update time stamp */
-		sci->sc_seg_ctime = get_seconds();
+		sci->sc_seg_ctime = ktime_get_real_seconds();
 
 		err = nilfs_segctor_collect(sci, nilfs, mode);
 		if (unlikely(err))

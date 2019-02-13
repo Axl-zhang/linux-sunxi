@@ -58,6 +58,7 @@
 #define ACPI_VIDEO_HID			"LNXVIDEO"
 #define ACPI_BAY_HID			"LNXIOBAY"
 #define ACPI_DOCK_HID			"LNXDOCK"
+#define ACPI_ECDT_HID			"LNXEC"
 /* Quirk for broken IBM BIOSes */
 #define ACPI_SMBUS_IBM_HID		"SMBUSIBM"
 
@@ -87,7 +88,14 @@ int acpi_pci_link_free_irq(acpi_handle handle);
 
 struct pci_bus;
 
+#ifdef CONFIG_PCI
 struct pci_dev *acpi_get_pci_dev(acpi_handle);
+#else
+static inline struct pci_dev *acpi_get_pci_dev(acpi_handle handle)
+{
+	return NULL;
+}
+#endif
 
 /* Arch-defined function to add a bus to the system */
 

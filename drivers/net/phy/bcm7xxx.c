@@ -65,10 +65,10 @@ struct bcm7xxx_phy_priv {
 static void r_rc_cal_reset(struct phy_device *phydev)
 {
 	/* Reset R_CAL/RC_CAL Engine */
-	bcm_phy_write_exp(phydev, 0x00b0, 0x0010);
+	bcm_phy_write_exp_sel(phydev, 0x00b0, 0x0010);
 
 	/* Disable Reset R_AL/RC_CAL Engine */
-	bcm_phy_write_exp(phydev, 0x00b0, 0x0000);
+	bcm_phy_write_exp_sel(phydev, 0x00b0, 0x0000);
 }
 
 static int bcm7xxx_28nm_b0_afe_config_init(struct phy_device *phydev)
@@ -229,6 +229,7 @@ static int bcm7xxx_28nm_config_init(struct phy_device *phydev)
 	phy_read(phydev, MII_BMSR);
 
 	switch (rev) {
+	case 0xa0:
 	case 0xb0:
 		ret = bcm7xxx_28nm_b0_afe_config_init(phydev);
 		break;
@@ -565,7 +566,7 @@ static int bcm7xxx_28nm_set_tunable(struct phy_device *phydev,
 	if (ret)
 		return ret;
 
-	/* Disable EEE advertisment since this prevents the PHY
+	/* Disable EEE advertisement since this prevents the PHY
 	 * from successfully linking up, trigger auto-negotiation restart
 	 * to let the MAC decide what to do.
 	 */
@@ -611,8 +612,6 @@ static int bcm7xxx_28nm_probe(struct phy_device *phydev)
 	.features	= PHY_GBIT_FEATURES,				\
 	.flags		= PHY_IS_INTERNAL,				\
 	.config_init	= bcm7xxx_28nm_config_init,			\
-	.config_aneg	= genphy_config_aneg,				\
-	.read_status	= genphy_read_status,				\
 	.resume		= bcm7xxx_28nm_resume,				\
 	.get_tunable	= bcm7xxx_28nm_get_tunable,			\
 	.set_tunable	= bcm7xxx_28nm_set_tunable,			\
@@ -630,8 +629,6 @@ static int bcm7xxx_28nm_probe(struct phy_device *phydev)
 	.features	= PHY_BASIC_FEATURES,				\
 	.flags		= PHY_IS_INTERNAL,				\
 	.config_init	= bcm7xxx_28nm_ephy_config_init,		\
-	.config_aneg	= genphy_config_aneg,				\
-	.read_status	= genphy_read_status,				\
 	.resume		= bcm7xxx_28nm_ephy_resume,			\
 	.get_sset_count	= bcm_phy_get_sset_count,			\
 	.get_strings	= bcm_phy_get_strings,				\
@@ -647,14 +644,13 @@ static int bcm7xxx_28nm_probe(struct phy_device *phydev)
 	.features       = PHY_BASIC_FEATURES,				\
 	.flags          = PHY_IS_INTERNAL,				\
 	.config_init    = bcm7xxx_config_init,				\
-	.config_aneg    = genphy_config_aneg,				\
-	.read_status    = genphy_read_status,				\
 	.suspend        = bcm7xxx_suspend,				\
 	.resume         = bcm7xxx_config_init,				\
 }
 
 static struct phy_driver bcm7xxx_driver[] = {
 	BCM7XXX_28NM_GPHY(PHY_ID_BCM7250, "Broadcom BCM7250"),
+	BCM7XXX_28NM_EPHY(PHY_ID_BCM7255, "Broadcom BCM7255"),
 	BCM7XXX_28NM_EPHY(PHY_ID_BCM7260, "Broadcom BCM7260"),
 	BCM7XXX_28NM_EPHY(PHY_ID_BCM7268, "Broadcom BCM7268"),
 	BCM7XXX_28NM_EPHY(PHY_ID_BCM7271, "Broadcom BCM7271"),
@@ -665,6 +661,7 @@ static struct phy_driver bcm7xxx_driver[] = {
 	BCM7XXX_28NM_GPHY(PHY_ID_BCM7439, "Broadcom BCM7439"),
 	BCM7XXX_28NM_GPHY(PHY_ID_BCM7439_2, "Broadcom BCM7439 (2)"),
 	BCM7XXX_28NM_GPHY(PHY_ID_BCM7445, "Broadcom BCM7445"),
+	BCM7XXX_28NM_GPHY(PHY_ID_BCM_OMEGA, "Broadcom Omega Combo GPHY"),
 	BCM7XXX_40NM_EPHY(PHY_ID_BCM7346, "Broadcom BCM7346"),
 	BCM7XXX_40NM_EPHY(PHY_ID_BCM7362, "Broadcom BCM7362"),
 	BCM7XXX_40NM_EPHY(PHY_ID_BCM7425, "Broadcom BCM7425"),
@@ -674,6 +671,7 @@ static struct phy_driver bcm7xxx_driver[] = {
 
 static struct mdio_device_id __maybe_unused bcm7xxx_tbl[] = {
 	{ PHY_ID_BCM7250, 0xfffffff0, },
+	{ PHY_ID_BCM7255, 0xfffffff0, },
 	{ PHY_ID_BCM7260, 0xfffffff0, },
 	{ PHY_ID_BCM7268, 0xfffffff0, },
 	{ PHY_ID_BCM7271, 0xfffffff0, },

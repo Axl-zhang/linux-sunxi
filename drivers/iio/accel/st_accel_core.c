@@ -103,6 +103,7 @@ static const struct st_sensor_settings st_accel_sensors_settings[] = {
 			[4] = LSM330DLC_ACCEL_DEV_NAME,
 			[5] = LSM303AGR_ACCEL_DEV_NAME,
 			[6] = LIS2DH12_ACCEL_DEV_NAME,
+			[7] = LIS3DE_ACCEL_DEV_NAME,
 		},
 		.ch = (struct iio_chan_spec *)st_accel_12bit_channels,
 		.odr = {
@@ -951,7 +952,7 @@ int st_accel_common_probe(struct iio_dev *indio_dev)
 	if (!pdata)
 		pdata = (struct st_sensors_platform_data *)&default_accel_pdata;
 
-	err = st_sensors_init_sensor(indio_dev, adata->dev->platform_data);
+	err = st_sensors_init_sensor(indio_dev, pdata);
 	if (err < 0)
 		goto st_accel_power_off;
 
